@@ -1,0 +1,13 @@
+.localhost.pid
+localhost.out.log
+localhost.err.log
+
+data/uploads/
+data/jobs/
+data/seeds/
+data/exports/
+data/logos/
+data/market_keys/
+
+__pycache__/
+*.pyc
