@@ -1677,6 +1677,10 @@ function KeywordWorkbench({
       src,
     }));
   };
+  const getDetailImageSrcs = (row) => {
+    const images = row?.images || row?.seedProduct?.images || {};
+    return uniqueList((Array.isArray(images.detail) ? images.detail : []).filter(Boolean));
+  };
   const getMainImageId = (row) => mainImageByProduct[imageKeyFor(row)] || 'main';
   const setRowMainImage = (row, imageId) => {
     if (!row) return;
@@ -1757,6 +1761,7 @@ function KeywordWorkbench({
         const additionalImageSrcs = rowImageSlots
           .filter((slot) => slot.src && slot.src !== selectedImage?.src)
           .map((slot) => slot.src);
+        const detailImageSrcs = getDetailImageSrcs(row);
         items.push({
           channelKey: item.key,
           account: item.account,
@@ -1772,9 +1777,17 @@ function KeywordWorkbench({
           mainImageLabel: selectedImage?.label || '1번',
           mainImageSrc: selectedImage?.src || row.thumb,
           additionalImageSrcs,
+          detailImageSrcs,
+          detailHtml: row.detailHtml || row.seedProduct?.detailHtml || '',
           thumb: row.thumb,
           price: row.price,
+          supplyPrice: row.supplyPrice || row.seedProduct?.supplyPrice || 0,
+          salePrice: row.salePrice || row.seedProduct?.salePrice || row.price || 0,
+          consumerPrice: row.consumerPrice || row.seedProduct?.consumerPrice || 0,
           optionSummary: row.opt,
+          optionInput: row.optionInput || row.seedProduct?.optionInput || '',
+          optionAdditionalAmounts: row.optionAdditionalAmounts || row.seedProduct?.optionAdditionalAmounts || [],
+          optionItems: row.optionItems || row.seedProduct?.optionItems || [],
           naverProvidedNotice: row.seedProduct?.naverProvidedNotice || row.naverProvidedNotice || null,
         });
       });
@@ -2040,6 +2053,7 @@ function MarketUploadWorkbench({
   onRuntimeArtifact,
 }) {
   const [uploadStatus, setUploadStatus] = useState({});
+  const [uploadBusy, setUploadBusy] = useState(false);
   const scopedChannels = Object.entries(marketSelection || {})
     .filter(([, enabled]) => enabled !== false)
     .filter(([key]) => !key.endsWith(':Cafe24'))
@@ -2061,7 +2075,14 @@ function MarketUploadWorkbench({
     name: queuedItems.find((item) => item.gs === gs)?.sourceName || gs,
     thumb: queuedItems.find((item) => item.gs === gs)?.thumb || '',
     price: queuedItems.find((item) => item.gs === gs)?.price || 0,
+    supplyPrice: queuedItems.find((item) => item.gs === gs)?.supplyPrice || 0,
+    salePrice: queuedItems.find((item) => item.gs === gs)?.salePrice || queuedItems.find((item) => item.gs === gs)?.price || 0,
+    consumerPrice: queuedItems.find((item) => item.gs === gs)?.consumerPrice || 0,
     opt: queuedItems.find((item) => item.gs === gs)?.optionSummary || '',
+    optionInput: queuedItems.find((item) => item.gs === gs)?.optionInput || '',
+    optionAdditionalAmounts: queuedItems.find((item) => item.gs === gs)?.optionAdditionalAmounts || [],
+    optionItems: queuedItems.find((item) => item.gs === gs)?.optionItems || [],
+    detailHtml: queuedItems.find((item) => item.gs === gs)?.detailHtml || '',
     naverProvidedNotice: queuedItems.find((item) => item.gs === gs)?.naverProvidedNotice || null,
     marketKeywords: {},
   });
@@ -2080,6 +2101,14 @@ function MarketUploadWorkbench({
       mainImageLabel: entry?.mainImageLabel || '1번',
       mainImageSrc: entry?.mainImageSrc || row?.thumb || '',
       additionalImageSrcs: Array.isArray(entry?.additionalImageSrcs) ? entry.additionalImageSrcs : [],
+      detailImageSrcs: Array.isArray(entry?.detailImageSrcs)
+        ? entry.detailImageSrcs
+        : Array.isArray(row?.images?.detail)
+          ? row.images.detail
+          : Array.isArray(row?.seedProduct?.images?.detail)
+            ? row.seedProduct.images.detail
+            : [],
+      detailHtml: entry?.detailHtml || row?.detailHtml || row?.seedProduct?.detailHtml || '',
       cafe24Url: entry?.cafe24Url || row?.cafe24Url || `https://mall.cafe24.com/${row?.gs || ''}`,
     };
   };
@@ -2170,9 +2199,17 @@ function MarketUploadWorkbench({
           mainImage: variant.mainImageLabel,
           mainImageSrc: variant.mainImageSrc,
           additionalImageSrcs: variant.additionalImageSrcs || [],
+          detailImageSrcs: variant.detailImageSrcs || [],
+          detailHtml: variant.detailHtml || queued?.detailHtml || row.detailHtml || row.seedProduct?.detailHtml || '',
           cafe24Url: variant.cafe24Url,
           price: row.price || queued?.price || 0,
+          supplyPrice: row.supplyPrice || queued?.supplyPrice || 0,
+          salePrice: row.salePrice || queued?.salePrice || row.price || 0,
+          consumerPrice: row.consumerPrice || queued?.consumerPrice || 0,
           optionSummary: row.opt || queued?.optionSummary || '',
+          optionInput: row.optionInput || queued?.optionInput || '',
+          optionAdditionalAmounts: row.optionAdditionalAmounts || queued?.optionAdditionalAmounts || [],
+          optionItems: row.optionItems || queued?.optionItems || [],
           naverProvidedNotice: queued?.naverProvidedNotice || row.seedProduct?.naverProvidedNotice || row.naverProvidedNotice || null,
         };
       }),
@@ -2207,7 +2244,20 @@ function MarketUploadWorkbench({
         mainImageLabel: item.mainImage,
         mainImageSrc: item.mainImageSrc,
         additionalImageSrcs: item.additionalImageSrcs || [],
+        detailImageSrcs: item.detailImageSrcs || [],
+        detailHtml: item.detailHtml || '',
         cafe24Url: item.cafe24Url,
+        price: item.price,
+        supplyPrice: item.supplyPrice,
+        salePrice: item.salePrice,
+        consumerPrice: item.consumerPrice,
+        optionSummary: item.optionSummary,
+        optionInput: item.optionInput,
+        optionAdditionalAmounts: item.optionAdditionalAmounts || [],
+        optionItems: item.optionItems || [],
+        productId: item.productId || item.sellerProductId || item.spdNo || '',
+        rawStatus: item.rawStatus || '',
+        workbookPath: item.workbookPath || '',
         error: item.error || '',
       });
       return acc;
@@ -2223,6 +2273,7 @@ function MarketUploadWorkbench({
         if (Array.isArray(job.results)) applyUploadJobResults(job.results);
         if (job.status === 'completed') {
           applyUploadJobResults(job.result?.results || []);
+          setUploadBusy(false);
           return;
         }
         if (job.status === 'failed') {
@@ -2233,6 +2284,7 @@ function MarketUploadWorkbench({
             });
             return next;
           });
+          setUploadBusy(false);
           return;
         }
         pollUploadJob(jobId);
@@ -2244,12 +2296,15 @@ function MarketUploadWorkbench({
           });
           return next;
         });
+        setUploadBusy(false);
       }
     }, 1200);
   };
   const runApiUpload = async () => {
+    if (uploadBusy) return;
     const entries = buildSelectedEntries((channel) => !['11번가', 'ESM'].includes(channel.market));
     const payload = storeUploadPayload(entries, 'apiMarketUploadQueue');
+    setUploadBusy(true);
     setUploadStatus((prev) => {
       const next = {...prev};
       entries.forEach(({ key }) => { next[key] = 'running'; });
@@ -2266,7 +2321,17 @@ function MarketUploadWorkbench({
       mainImageLabel: variant.mainImageLabel,
       mainImageSrc: variant.mainImageSrc,
       additionalImageSrcs: variant.additionalImageSrcs || [],
+      detailImageSrcs: variant.detailImageSrcs || [],
+      detailHtml: variant.detailHtml || row.detailHtml || row.seedProduct?.detailHtml || '',
       cafe24Url: variant.cafe24Url,
+      price: row.price || queuedItemMap.get(`${channel.key}:${row.gs}`)?.price || 0,
+      supplyPrice: row.supplyPrice || queuedItemMap.get(`${channel.key}:${row.gs}`)?.supplyPrice || 0,
+      salePrice: row.salePrice || queuedItemMap.get(`${channel.key}:${row.gs}`)?.salePrice || row.price || 0,
+      consumerPrice: row.consumerPrice || queuedItemMap.get(`${channel.key}:${row.gs}`)?.consumerPrice || 0,
+      optionSummary: row.opt || queuedItemMap.get(`${channel.key}:${row.gs}`)?.optionSummary || '',
+      optionInput: row.optionInput || queuedItemMap.get(`${channel.key}:${row.gs}`)?.optionInput || '',
+      optionAdditionalAmounts: row.optionAdditionalAmounts || queuedItemMap.get(`${channel.key}:${row.gs}`)?.optionAdditionalAmounts || [],
+      optionItems: row.optionItems || queuedItemMap.get(`${channel.key}:${row.gs}`)?.optionItems || [],
     })), 'running');
     try {
       const response = await fetch('/api/market-upload', {
@@ -2284,6 +2349,7 @@ function MarketUploadWorkbench({
         entries.forEach(({ key }) => { next[key] = 'failed'; });
         return next;
       });
+      setUploadBusy(false);
     }
   };
   const downloadExcelData = async (market) => {
@@ -2298,12 +2364,20 @@ function MarketUploadWorkbench({
       const result = await response.json();
       if (!response.ok || !result?.ok) throw new Error(result?.error || `export ${response.status}`);
       onRuntimeArtifact?.({ path: result.export?.path });
-      const link = document.createElement('a');
-      link.href = result.export.url;
-      link.download = result.export.fileName;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
+      const exportFiles = Array.isArray(result.export?.files) && result.export.files.length
+        ? result.export.files
+        : [result.export].filter(Boolean);
+      exportFiles.forEach((file, index) => {
+        if (!file?.url) return;
+        setTimeout(() => {
+          const link = document.createElement('a');
+          link.href = file.url;
+          link.download = file.fileName || '';
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+        }, index * 250);
+      });
       setUploadStatus((prev) => {
         const next = {...prev};
         entries.forEach(({ key }) => { next[key] = 'exported'; });
@@ -2320,7 +2394,17 @@ function MarketUploadWorkbench({
         mainImageLabel: variant.mainImageLabel,
         mainImageSrc: variant.mainImageSrc,
         additionalImageSrcs: variant.additionalImageSrcs || [],
+        detailImageSrcs: variant.detailImageSrcs || [],
+        detailHtml: variant.detailHtml || row.detailHtml || row.seedProduct?.detailHtml || '',
         cafe24Url: variant.cafe24Url,
+        price: row.price || queuedItemMap.get(`${channel.key}:${row.gs}`)?.price || 0,
+        supplyPrice: row.supplyPrice || queuedItemMap.get(`${channel.key}:${row.gs}`)?.supplyPrice || 0,
+        salePrice: row.salePrice || queuedItemMap.get(`${channel.key}:${row.gs}`)?.salePrice || row.price || 0,
+        consumerPrice: row.consumerPrice || queuedItemMap.get(`${channel.key}:${row.gs}`)?.consumerPrice || 0,
+        optionSummary: row.opt || queuedItemMap.get(`${channel.key}:${row.gs}`)?.optionSummary || '',
+        optionInput: row.optionInput || queuedItemMap.get(`${channel.key}:${row.gs}`)?.optionInput || '',
+        optionAdditionalAmounts: row.optionAdditionalAmounts || queuedItemMap.get(`${channel.key}:${row.gs}`)?.optionAdditionalAmounts || [],
+        optionItems: row.optionItems || queuedItemMap.get(`${channel.key}:${row.gs}`)?.optionItems || [],
       })), 'exported');
     } catch (error) {
       setUploadStatus((prev) => {
@@ -2357,7 +2441,9 @@ function MarketUploadWorkbench({
             <GhostBtn onClick={() => setUploadSelection(new Set(availableKeys))}>전체 선택</GhostBtn>
             <GhostBtn icon={<IconFile size={16}/>} onClick={() => downloadExcelData('11번가')} disabled={!buildSelectedEntries((channel) => channel.market === '11번가').length}>11번가 엑셀 저장</GhostBtn>
             <GhostBtn icon={<IconFile size={16}/>} onClick={() => downloadExcelData('ESM')} disabled={!buildSelectedEntries((channel) => channel.market === 'ESM').length}>ESM 엑셀 저장</GhostBtn>
-            <AuroraBtn icon={<IconUpload size={16}/>} onClick={runApiUpload} disabled={!apiSelectedCount}>선택 API 업로드</AuroraBtn>
+            <AuroraBtn icon={<IconUpload size={16}/>} onClick={runApiUpload} disabled={!apiSelectedCount || uploadBusy}>
+              {uploadBusy ? 'API 업로드 중' : '선택 API 업로드'}
+            </AuroraBtn>
           </div>
         </div>
 
@@ -2425,7 +2511,7 @@ function MarketUploadWorkbench({
                       <button
                         type="button"
                         key={channel.key}
-                        disabled={!available}
+                        disabled={!available || uploadBusy}
                         className={`upload-market-cell ${uploadSelection.has(key) ? 'selected' : ''} ${available ? '' : 'disabled'}`}
                         onClick={() => available && toggleUpload(key)}>
                         <span className="upload-cell-top">
@@ -2445,6 +2531,211 @@ function MarketUploadWorkbench({
       </section>
 
     </div>
+  );
+}
+
+function UploadResultTable({
+  rows,
+  selectedGs = new Set(),
+  history = {},
+  onUploadHistoryChange,
+  onRuntimeArtifact,
+}) {
+  const [retrying, setRetrying] = useState(new Set());
+  const apiMarkets = new Set(['네이버', '쿠팡', '롯데ON']);
+  const channels = ['A', 'B'].flatMap((account) => MARKETS.map((market) => ({
+    key: `${account}:${market}`,
+    account,
+    market,
+  })));
+  const rowByGs = new Map(rows.map((row) => [row.gs, row]));
+  const selectedRows = selectedGs?.size ? rows.filter((row) => selectedGs.has(row.gs)) : rows;
+  const historyFor = (row, channel) => history?.[`${channel.key}:${row.gs}`] || null;
+  const cellStatus = (row, channel) => {
+    const retryKey = `${channel.key}:${row.gs}`;
+    if (retrying.has(retryKey)) return 'running';
+    const item = historyFor(row, channel);
+    if (item?.status) return item.status;
+    if (channel.market === 'Cafe24' && row.cafe24Url) return 'uploaded';
+    return row[channel.account]?.[MARKETS.indexOf(channel.market)] || 'muted';
+  };
+  const labelFor = (status, market) => {
+    if (status === 'running') return '서버처리';
+    if (status === 'uploaded') return '업로드 완료';
+    if (status === 'failed') return '실패';
+    if (status === 'exported' || status === 'excel') return '엑셀 저장';
+    if (status === 'skipped') return '제외';
+    if (status === 'muted' || !status) return '미등록';
+    if ((market === '11번가' || market === 'ESM') && ['queued', 'targeted'].includes(status)) return '등록';
+    return '미등록';
+  };
+  const normaliseRetryItem = (item, row, channel) => ({
+    queueKey: item?.queueKey || `${channel.key}:${row.gs}`,
+    account: channel.account,
+    market: channel.market,
+    channel: channel.key,
+    channelKey: channel.key,
+    gs: row.gs,
+    sourceName: item?.sourceName || row.name,
+    title: item?.title || row.marketKeywords?.[channel.key]?.title || row.name,
+    searchTerms: item?.searchTerms || row.marketKeywords?.[channel.key]?.searchTerms || '',
+    mainImage: item?.mainImageLabel || item?.mainImage || '1번',
+    mainImageLabel: item?.mainImageLabel || item?.mainImage || '1번',
+    mainImageSrc: item?.mainImageSrc || row.thumb || '',
+    additionalImageSrcs: item?.additionalImageSrcs || row.seedProduct?.images?.additional || [],
+    detailImageSrcs: item?.detailImageSrcs || row.seedProduct?.images?.detail || row.images?.detail || [],
+    detailHtml: item?.detailHtml || row.detailHtml || row.seedProduct?.detailHtml || '',
+    cafe24Url: item?.cafe24Url || row.cafe24Url || '',
+    price: item?.price || row.price || 0,
+    supplyPrice: item?.supplyPrice || row.supplyPrice || row.seedProduct?.supplyPrice || 0,
+    salePrice: item?.salePrice || row.salePrice || row.seedProduct?.salePrice || row.price || 0,
+    consumerPrice: item?.consumerPrice || row.consumerPrice || row.seedProduct?.consumerPrice || 0,
+    optionSummary: item?.optionSummary || row.opt || '',
+    optionInput: item?.optionInput || row.optionInput || row.seedProduct?.optionInput || '',
+    optionAdditionalAmounts: item?.optionAdditionalAmounts || row.optionAdditionalAmounts || row.seedProduct?.optionAdditionalAmounts || [],
+    optionItems: item?.optionItems || row.optionItems || row.seedProduct?.optionItems || [],
+    naverProvidedNotice: item?.naverProvidedNotice || row.naverProvidedNotice || row.seedProduct?.naverProvidedNotice || null,
+  });
+  const applyRetryResults = (results = []) => {
+    if (!Array.isArray(results) || !results.length) return;
+    const grouped = results.reduce((acc, item) => {
+      const status = item.status || 'failed';
+      if (!acc[status]) acc[status] = [];
+      acc[status].push({
+        channelKey: item.channel,
+        account: item.account,
+        market: item.market,
+        gs: item.gs,
+        sourceName: item.sourceName,
+        title: item.title,
+        searchTerms: item.searchTerms,
+        mainImageLabel: item.mainImage,
+        mainImageSrc: item.mainImageSrc,
+        additionalImageSrcs: item.additionalImageSrcs || [],
+        detailImageSrcs: item.detailImageSrcs || [],
+        detailHtml: item.detailHtml || '',
+        cafe24Url: item.cafe24Url,
+        price: item.price,
+        supplyPrice: item.supplyPrice,
+        salePrice: item.salePrice,
+        consumerPrice: item.consumerPrice,
+        optionSummary: item.optionSummary,
+        optionInput: item.optionInput,
+        optionAdditionalAmounts: item.optionAdditionalAmounts || [],
+        optionItems: item.optionItems || [],
+        productId: item.productId || item.sellerProductId || item.spdNo || '',
+        rawStatus: item.rawStatus || '',
+        workbookPath: item.workbookPath || '',
+        error: item.error || '',
+      });
+      return acc;
+    }, {});
+    Object.entries(grouped).forEach(([status, items]) => onUploadHistoryChange?.(items, status));
+    setRetrying((prev) => {
+      const next = new Set(prev);
+      results.forEach((item) => next.delete(item.queueKey || `${item.channel}:${item.gs}`));
+      return next;
+    });
+  };
+  const pollRetryJob = (jobId) => {
+    window.setTimeout(async () => {
+      try {
+        const response = await fetch(`/api/jobs/${jobId}`);
+        const job = await response.json();
+        if (!response.ok || !job?.ok) throw new Error(job?.error || `job ${response.status}`);
+        if (Array.isArray(job.results)) applyRetryResults(job.results);
+        if (job.status === 'completed') {
+          applyRetryResults(job.result?.results || []);
+          return;
+        }
+        if (job.status === 'failed') {
+          setRetrying(new Set());
+          return;
+        }
+        pollRetryJob(jobId);
+      } catch {
+        setRetrying(new Set());
+      }
+    }, 1200);
+  };
+  const retryItems = async (items) => {
+    const rowsToSend = items.filter(Boolean);
+    if (!rowsToSend.length) return;
+    setRetrying((prev) => {
+      const next = new Set(prev);
+      rowsToSend.forEach((item) => next.add(item.queueKey || `${item.channelKey}:${item.gs}`));
+      return next;
+    });
+    onUploadHistoryChange?.(rowsToSend, 'running');
+    try {
+      const response = await fetch('/api/market-upload', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ action: 'retryMarketUpload', rows: rowsToSend }),
+      });
+      const result = await response.json();
+      if (!response.ok || !result?.ok) throw new Error(result?.error || `retry ${response.status}`);
+      onRuntimeArtifact?.({ jobId: result.jobId });
+      pollRetryJob(result.jobId);
+    } catch {
+      onUploadHistoryChange?.(rowsToSend, 'failed');
+      setRetrying(new Set());
+    }
+  };
+  const failedRetryItems = selectedRows.flatMap((row) => channels.map((channel) => {
+    const status = cellStatus(row, channel);
+    if (status !== 'failed' || !apiMarkets.has(channel.market)) return null;
+    return normaliseRetryItem(historyFor(row, channel), row, channel);
+  }).filter(Boolean));
+
+  return (
+    <section className="upload-result-table surface">
+      <div className="upload-head">
+        <div>
+          <span className="t-eyebrow">RESULT · MARKET MATRIX</span>
+          <h3>업로드 결과 체크표</h3>
+        </div>
+        <div className="upload-actions">
+          <GhostBtn onClick={() => retryItems(failedRetryItems)} disabled={!failedRetryItems.length || retrying.size > 0}>
+            실패 API 재업로드
+          </GhostBtn>
+        </div>
+      </div>
+      <div className="result-grid-wrap">
+        <div className="result-grid" style={{gridTemplateColumns: `260px repeat(${channels.length}, 170px)`}}>
+          <div className="result-head-cell">상품</div>
+          {channels.map((channel) => (
+            <div className="result-head-cell" key={channel.key}>{channel.key}</div>
+          ))}
+          {selectedRows.map((row) => (
+            <React.Fragment key={row.gs}>
+              <div className="result-product-cell">
+                <ProductThumb src={row.thumb} alt={row.name} compact/>
+                <span><strong className="mono">{row.gs}</strong><small>{row.name}</small></span>
+              </div>
+              {channels.map((channel) => {
+                const item = historyFor(row, channel);
+                const status = cellStatus(row, channel);
+                const canRetry = status === 'failed' && apiMarkets.has(channel.market);
+                const retryItem = normaliseRetryItem(item, row, channel);
+                return (
+                  <div className={`result-market-cell is-${status}`} key={channel.key}>
+                    <Pill status={status}>{labelFor(status, channel.market)}</Pill>
+                    {item?.productId && <small className="mono">{item.productId}</small>}
+                    {item?.error && <small className="result-error">{item.error}</small>}
+                    {canRetry && (
+                      <button type="button" onClick={() => retryItems([retryItem])} disabled={retrying.size > 0}>
+                        재업로드
+                      </button>
+                    )}
+                  </div>
+                );
+              })}
+            </React.Fragment>
+          ))}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -2742,6 +3033,6 @@ Object.assign(window, {
   IconSearch, IconUpload, IconSync, IconSettings, IconEdit, IconClose, IconFile, IconFilter, IconCmd, IconChevR,
   AuroraBtn, VioletBtn, GhostBtn, IconBtn,
   Pill, Menu, MenuItem, MenuSection,
-  TopBar, Sidebar, DropZone, ImportPreview, ProductMatrix, AccountSummary, DetailModal, ViewSwitch, WorkflowActionPanel, KeywordOptionsModal, KeywordWorkbench, MarketUploadWorkbench, SettingsModal,
+  TopBar, Sidebar, DropZone, ImportPreview, ProductMatrix, UploadResultTable, AccountSummary, DetailModal, ViewSwitch, WorkflowActionPanel, KeywordOptionsModal, KeywordWorkbench, MarketUploadWorkbench, SettingsModal,
   MARKETS, SELLING_MARKETS, STATUS_LABEL,
 });

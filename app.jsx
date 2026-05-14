@@ -118,10 +118,16 @@ function seedPayloadToFile(seedPayload, meta = {}) {
       baseGs: product.baseGs || '',
       name: product.reviewFields?.productName || product.sourceName || product.gs || '',
       price: Number(product.price || 0),
+      supplyPrice: Number(product.supplyPrice || 0),
+      salePrice: Number(product.salePrice || product.price || 0),
+      consumerPrice: Number(product.consumerPrice || 0),
       opt: product.optionSummary || '단일',
+      optionInput: product.optionInput || '',
+      optionAdditionalAmounts: product.optionAdditionalAmounts || [],
       thumb: images.representative || images.sourceThumb || '',
       images,
       optionItems: product.optionItems || [],
+      detailHtml: product.detailHtml || '',
       optionType: product.optionType || '',
       optionCount: product.optionCount || 0,
       ocrStatus: ocr.status || 'pending',
@@ -162,12 +168,18 @@ function rowsForFile(file) {
     gs: row.gs,
     name: row.name,
     price: row.price || 0,
+    supplyPrice: row.supplyPrice || row.seedProduct?.supplyPrice || 0,
+    salePrice: row.salePrice || row.seedProduct?.salePrice || row.price || 0,
+    consumerPrice: row.consumerPrice || row.seedProduct?.consumerPrice || 0,
     opt: row.opt || '단일',
+    optionInput: row.optionInput || row.seedProduct?.optionInput || '',
+    optionAdditionalAmounts: row.optionAdditionalAmounts || row.seedProduct?.optionAdditionalAmounts || [],
     thumb: row.thumb || '',
     images: row.images || row.seedProduct?.images || {},
     optionType: row.optionType || '',
     optionCount: row.optionCount || 0,
     optionItems: row.optionItems || [],
+    detailHtml: row.detailHtml || row.seedProduct?.detailHtml || '',
     seedProduct: row.seedProduct || null,
     keywordCandidatePool: row.seedProduct?.keywordCandidatePool || row.keywordCandidatePool || {},
     generatedKeywordSeed: row.seedProduct?.generatedKeywordSeed || row.generatedKeywordSeed || {},
@@ -844,6 +856,7 @@ function App() {
     const marketKeywords = row.marketKeywords || row.seedProduct?.marketKeywords || {};
     return Object.keys(marketKeywords).length > 0;
   });
+  const canUseSeedKeywords = keywordHasResults;
   const sourceSeedProgress = Math.max(0, Math.min(100, Number(
     sourceSeedJob?.progressPercent
       ?? (sourceSeedJob?.status === 'completed' ? 100 : sourceSeedJob?.status === 'failed' ? 100 : 0)
@@ -865,7 +878,33 @@ function App() {
   const goBack = () => {
     moveToFlowStep(PIPELINE_STEPS[currentFlowIndex - 1]);
   };
-  const goForward = () => {
+  const stopKeywordJobIfRunning = async () => {
+    if (!keywordRunning || !keywordJob?.jobId) return;
+    try {
+      await fetch('/api/job-stop', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jobId: keywordJob.jobId }),
+      });
+      addLog(`키워드 생성 중지: ${keywordJob.jobId}`);
+    } catch (error) {
+      addLog(`키워드 생성 중지 실패: ${error.message}`);
+    }
+  };
+  const moveToUploadWithSeedKeywords = async () => {
+    await stopKeywordJobIfRunning();
+    setKeywordOptionsOpen(false);
+    setKeywordJob({
+      status: 'completed',
+      action: 'keywordGenerate',
+      progressPercent: 100,
+      currentStage: '시드 저장 키워드 사용',
+      skippedGeneration: true,
+    });
+    addLog('시드에 저장된 상품명/검색어 사용: 키워드 생성 건너뛰고 업로드 화면으로 이동');
+    setStage('upload');
+  };
+  const goForward = async () => {
     setSelected(null);
     if (currentFlowKey === 'drop') {
       moveToFlowStep(PIPELINE_STEPS[currentFlowIndex + 1]);
@@ -884,15 +923,19 @@ function App() {
       return;
     }
     if (currentFlowKey === 'market-seed') {
+      if (canUseSeedKeywords) {
+        await moveToUploadWithSeedKeywords();
+        return;
+      }
       generateKeywords();
       return;
     }
     if (currentFlowKey === 'keyword') {
-      if (!keywordHasResults) {
+      if (!canUseSeedKeywords) {
         generateKeywords();
         return;
       }
-      setStage('upload');
+      await moveToUploadWithSeedKeywords();
       return;
     }
     if (currentFlowKey === 'upload') {
@@ -911,18 +954,18 @@ function App() {
         : currentFlowKey === 'seed-review'
           ? '마켓별 작업'
             : currentFlowKey === 'market-seed'
-              ? '키워드 생성'
+              ? canUseSeedKeywords ? '업로드 화면' : '키워드 생성'
             : currentFlowKey === 'keyword'
-              ? keywordHasResults ? '업로드 화면' : '키워드 생성 시작'
+              ? canUseSeedKeywords ? '업로드 화면' : '키워드 생성 시작'
               : currentFlowKey === 'upload'
                 ? '결과 확인'
               : PIPELINE_STEPS[currentFlowIndex + 1]?.title || '다음';
     return {
       title: currentStep.title,
       backLabel: previousStep?.title || '처음 단계',
-      forwardLabel: sourceSeedRunning ? `생성 중 ${sourceSeedProgress}%` : keywordRunning ? `생성 중 ${keywordProgress}%` : forwardLabel,
+      forwardLabel: sourceSeedRunning ? `생성 중 ${sourceSeedProgress}%` : keywordRunning && !canUseSeedKeywords ? `생성 중 ${keywordProgress}%` : forwardLabel,
       canBack: currentFlowIndex > 0,
-      canForward: currentFlowIndex < PIPELINE_STEPS.length - 1 && !!file && !sourceSeedRunning && !keywordRunning,
+      canForward: currentFlowIndex < PIPELINE_STEPS.length - 1 && !!file && !sourceSeedRunning && (!keywordRunning || canUseSeedKeywords),
     };
   })();
 
@@ -1088,14 +1131,12 @@ function App() {
                   <div><small>업로드 완료</small><strong style={{color:'var(--color-quizlet-violet)'}}>{counts.all.uploaded}</strong></div>
                 </div>
               </div>
-              <ProductMatrix
+              <UploadResultTable
                 rows={productRows}
-                selectedId={selected}
                 selectedGs={selectedGs}
-                onToggleProduct={toggleProductSelection}
-                onSelectAll={selectAllProducts}
-                onClearAll={clearAllProducts}
-                onSelect={(id) => setSelected(id === selected ? null : id)}/>
+                history={uploadHistory}
+                onRuntimeArtifact={rememberSessionArtifact}
+                onUploadHistoryChange={updateUploadHistory}/>
             </>
           )}
 

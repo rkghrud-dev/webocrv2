@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 import csv
 import hashlib
 import hmac
@@ -50,6 +50,8 @@ ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
 ACTIVE_PROCESS_LOCK = threading.Lock()
 CANCELLED_JOB_IDS: set[str] = set()
 MARKET_KEY_OVERLAY_LOCK = threading.Lock()
+ACTIVE_MARKET_UPLOAD_LOCK = threading.Lock()
+MARKET_UPLOAD_TIMEOUT_SECONDS = 900
 
 
 KEYWORD_POOL_CATEGORIES = [
@@ -131,6 +133,7 @@ BANNED_MARKETING_TERMS = [
 
 LISTING_IMAGE_COLUMNS = [
     "이미지등록(목록)",
+    "이미지등록(상세)",
     "목록이미지",
     "대표이미지",
     "대표 이미지",
@@ -150,12 +153,18 @@ ADDITIONAL_IMAGE_COLUMNS = [
 ]
 
 DETAIL_IMAGE_COLUMNS = [
-    "이미지등록(상세)",
     "상품 상세설명",
     "모바일 상품 상세설명",
     "상세설명",
     "상품상세설명",
     "상세이미지",
+]
+
+DETAIL_HTML_COLUMNS = [
+    "상품 상세설명",
+    "모바일 상품 상세설명",
+    "상세설명",
+    "상품상세설명",
 ]
 
 SEED_ANALYSIS_POLICY = {
@@ -609,6 +618,42 @@ def price_value(value: object) -> int:
         return 0
 
 
+def v3_price_multiplier(value: object) -> float:
+    try:
+        amount = float(value)
+    except Exception:
+        return 2.0
+    if amount >= 20000:
+        return 1.6
+    if amount >= 10000:
+        return 1.8
+    return 2.0
+
+
+def round_100(value: object) -> int:
+    try:
+        return int(round(float(value), -2))
+    except Exception:
+        return 0
+
+
+def source_price_info(row: dict, headers: dict[str, str]) -> dict[str, int]:
+    supply = first_price(row, headers, ["공급가", "공급 가격", "공급가격", "매입가"])
+    raw_sale = first_price(row, headers, ["판매가", "상품가", "가격"])
+    raw_consumer = first_price(row, headers, ["소비자가", "정가"])
+    if supply:
+        sale = round_100(supply * v3_price_multiplier(supply))
+        consumer = round_100(sale * 1.2)
+    else:
+        sale = raw_sale or raw_consumer
+        consumer = raw_consumer or (round_100(sale * 1.2) if sale else 0)
+    return {
+        "supplyPrice": supply,
+        "salePrice": sale,
+        "consumerPrice": consumer,
+    }
+
+
 def first_value(row: dict, headers: dict[str, str], names: list[str]) -> str:
     for name in names:
         key = headers.get(normalize_header(name))
@@ -629,7 +674,7 @@ def first_price(row: dict, headers: dict[str, str], names: list[str]) -> int:
     return 0
 
 
-GS_CODE_RE = re.compile(r"(GS\d{7})([A-Z]?)", re.IGNORECASE)
+GS_CODE_RE = re.compile(r"(GS\d{7})([A-Z0-9]*)", re.IGNORECASE)
 
 
 def extract_gs(*values: object) -> str:
@@ -644,7 +689,7 @@ def split_gs(gs: str) -> tuple[str, str]:
     match = GS_CODE_RE.search(gs or "")
     if not match:
         return gs.upper(), ""
-    return match.group(1).upper(), match.group(2).upper()
+    return match.group(1).upper(), (match.group(2) or "").upper()
 
 
 def short_name(name: str, gs: str) -> str:
@@ -1427,10 +1472,16 @@ def build_seed_products(
             "baseGs": base_gs,
             "sourceName": row.get("name", ""),
             "price": row.get("price", 0),
+            "supplyPrice": row.get("supplyPrice", 0),
+            "salePrice": row.get("salePrice", row.get("price", 0)),
+            "consumerPrice": row.get("consumerPrice", 0),
             "optionSummary": option_summary,
+            "optionInput": row.get("optionInput", ""),
+            "optionAdditionalAmounts": row.get("optionAdditionalAmounts", []),
             "optionType": option_info["optionType"],
             "optionCount": option_info["optionCount"],
             "optionItems": option_items,
+            "detailHtml": row.get("detailHtml", ""),
             "images": {
                 "sourceThumb": source_thumb,
                 "representative": source_thumb,
@@ -1506,10 +1557,16 @@ def build_keyword_job_products(seed_payload: dict, selected_gs: list[str]) -> li
             "baseGs": base_gs,
             "sourceName": product.get("sourceName", ""),
             "price": product.get("price", 0),
+            "supplyPrice": product.get("supplyPrice", 0),
+            "salePrice": product.get("salePrice", product.get("price", 0)),
+            "consumerPrice": product.get("consumerPrice", 0),
             "optionSummary": product.get("optionSummary", ""),
+            "optionInput": product.get("optionInput", ""),
+            "optionAdditionalAmounts": product.get("optionAdditionalAmounts", []),
             "optionType": product.get("optionType", ""),
             "optionCount": product.get("optionCount", 0),
             "optionItems": product.get("optionItems", []),
+            "detailHtml": product.get("detailHtml", ""),
             "images": product.get("images", {}),
             "ocrAnalysis": {
                 "status": ocr.get("status", ""),
@@ -1806,11 +1863,36 @@ def extract_image_urls(value: str) -> list[str]:
 
 
 def collect_image_urls(row: dict, headers: dict[str, str], names: list[str]) -> list[str]:
-    return unique_terms([
+    return unique_image_urls([
         url
         for value in collect_values(row, headers, names)
         for url in extract_image_urls(value)
     ])
+
+
+def image_url_identity(value: object) -> str:
+    raw = text_value(value)
+    if not raw:
+        return ""
+    parsed = urllib.parse.urlparse(raw)
+    if parsed.scheme in {"http", "https"}:
+        host = parsed.netloc.lower()
+        path = urllib.parse.unquote(parsed.path).lower()
+        return f"{host}{path}"
+    return raw.replace("\\", "/").lower()
+
+
+def unique_image_urls(values: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        clean = text_value(value)
+        key = image_url_identity(clean)
+        if not clean or not key or key in seen:
+            continue
+        seen.add(key)
+        out.append(clean)
+    return out
 
 
 def parse_source_preview(path: Path, max_preview: int = 500) -> dict:
@@ -1830,11 +1912,12 @@ def parse_source_preview(path: Path, max_preview: int = 500) -> dict:
             continue
         base_gs, suffix = split_gs(gs)
         raw_gs_codes.add(gs)
-        price = first_price(row, headers, ["판매가", "상품가", "소비자가", "공급가", "가격"])
+        price_info = source_price_info(row, headers)
         opt = first_value(row, headers, ["옵션입력", "옵션", "옵션세트명", "옵션명", "규격"]) or "단일"
         listing_images = collect_image_urls(row, headers, LISTING_IMAGE_COLUMNS)
         additional_images = collect_image_urls(row, headers, ADDITIONAL_IMAGE_COLUMNS)
         detail_images = collect_image_urls(row, headers, DETAIL_IMAGE_COLUMNS)
+        detail_html = first_value(row, headers, DETAIL_HTML_COLUMNS)
         thumb = listing_images[0] if listing_images else ""
 
         groups.setdefault(base_gs, []).append({
@@ -1844,12 +1927,16 @@ def parse_source_preview(path: Path, max_preview: int = 500) -> dict:
             "suffix": suffix,
             "nameRaw": name_raw,
             "name": short_name(name_raw, gs),
-            "price": price,
+            "price": price_info["salePrice"],
+            "supplyPrice": price_info["supplyPrice"],
+            "salePrice": price_info["salePrice"],
+            "consumerPrice": price_info["consumerPrice"],
             "opt": opt,
             "thumb": thumb,
             "listingImages": listing_images,
             "additionalImages": additional_images,
             "detailImages": detail_images,
+            "detailHtml": detail_html,
         })
 
     preview = []
@@ -1878,26 +1965,45 @@ def parse_source_preview(path: Path, max_preview: int = 500) -> dict:
                 "name": item["name"],
                 "option": label or "단일",
                 "price": item["price"],
+                "supplyPrice": item.get("supplyPrice", 0),
+                "salePrice": item.get("salePrice", item["price"]),
+                "consumerPrice": item.get("consumerPrice", 0),
                 "thumb": item["thumb"],
             })
 
-        listing_images = unique_terms([
+        listing_images = unique_image_urls([
             url
             for item in items
             for url in (item.get("listingImages", []) + ([item.get("thumb", "")] if item.get("thumb") else []))
         ])
-        detail_images = unique_terms([
+        detail_images = unique_image_urls([
             url
             for item in items
             for url in item.get("detailImages", [])
         ])
+        detail_html = next((text_value(item.get("detailHtml")) for item in items if text_value(item.get("detailHtml"))), "")
         representative_thumb = representative["thumb"] or (listing_images[0] if listing_images else "")
-        additional_images = unique_terms([
+        additional_images = unique_image_urls([
             url
             for item in items
             for url in item.get("additionalImages", [])
         ] + [url for url in listing_images if url != representative_thumb])
-        additional_images = [url for url in additional_images if url not in set(detail_images) and url != representative_thumb][:20]
+        detail_keys = {image_url_identity(url) for url in detail_images}
+        representative_key = image_url_identity(representative_thumb)
+        additional_images = [
+            url for url in additional_images
+            if image_url_identity(url) not in detail_keys and image_url_identity(url) != representative_key
+        ][:20]
+        base_sale = option_items[0]["salePrice"] if option_items else representative["price"]
+        option_additionals = [
+            int((item.get("salePrice") or item.get("price") or 0) - base_sale)
+            for item in option_items
+        ] if len(option_items) > 1 else []
+        option_input = "옵션{" + "|".join(
+            f"{chr(65 + index)} {text_value(item.get('option'))}"
+            for index, item in enumerate(option_items[:26])
+            if text_value(item.get("option")) and text_value(item.get("option")) != "단일"
+        ) + "}" if len(option_items) > 1 else ""
 
         preview.append({
             "id": f"row-{len(preview) + 1}",
@@ -1905,10 +2011,16 @@ def parse_source_preview(path: Path, max_preview: int = 500) -> dict:
             "baseGs": base_gs,
             "name": base_name,
             "price": representative["price"],
+            "supplyPrice": representative.get("supplyPrice", 0),
+            "salePrice": representative.get("salePrice", representative["price"]),
+            "consumerPrice": representative.get("consumerPrice", 0),
             "opt": compact_option_summary(option_labels, len(items)),
+            "optionInput": option_input,
+            "optionAdditionalAmounts": option_additionals,
             "thumb": representative_thumb,
             "listingImages": listing_images,
             "detailImages": detail_images,
+            "detailHtml": detail_html,
             "additionalImages": additional_images,
             "optionItems": option_items,
         })
@@ -2485,6 +2597,15 @@ def normalize_upload_entries(payload: dict) -> list[dict]:
         additional_image_srcs = row.get("additionalImageSrcs")
         if not isinstance(additional_image_srcs, list):
             additional_image_srcs = extract_image_urls(row.get("additionalImageSrcs", ""))
+        detail_image_srcs = row.get("detailImageSrcs")
+        if not isinstance(detail_image_srcs, list):
+            detail_image_srcs = extract_image_urls(row.get("detailImageSrcs", ""))
+        option_items = row.get("optionItems")
+        if not isinstance(option_items, list):
+            option_items = []
+        option_additionals = row.get("optionAdditionalAmounts")
+        if not isinstance(option_additionals, list):
+            option_additionals = []
         entries.append({
             "queueKey": text_value(row.get("queueKey") or f"{channel}:{gs}"),
             "account": account,
@@ -2497,9 +2618,17 @@ def normalize_upload_entries(payload: dict) -> list[dict]:
             "mainImage": text_value(row.get("mainImage", "")),
             "mainImageSrc": text_value(row.get("mainImageSrc", "")),
             "additionalImageSrcs": [text_value(url) for url in additional_image_srcs if text_value(url)],
+            "detailImageSrcs": [text_value(url) for url in detail_image_srcs if text_value(url)],
+            "detailHtml": text_value(row.get("detailHtml", "")),
             "cafe24Url": text_value(row.get("cafe24Url", "")),
             "price": text_value(row.get("price") or row.get("salePrice") or ""),
+            "supplyPrice": text_value(row.get("supplyPrice") or ""),
+            "salePrice": text_value(row.get("salePrice") or row.get("price") or ""),
+            "consumerPrice": text_value(row.get("consumerPrice") or ""),
             "optionSummary": text_value(row.get("optionSummary") or row.get("opt") or ""),
+            "optionInput": text_value(row.get("optionInput") or ""),
+            "optionAdditionalAmounts": option_additionals,
+            "optionItems": option_items,
             "naverProvidedNotice": row.get("naverProvidedNotice") if isinstance(row.get("naverProvidedNotice"), dict) else {},
         })
     return entries
@@ -2533,7 +2662,40 @@ def option_summary_to_input(option_summary: object) -> str:
     parts = [part for part in parts if part and part not in {"옵션", "선택형"}]
     if not parts:
         return ""
-    return "|".join(f"{chr(65 + index)} {part}" for index, part in enumerate(parts[:26]))
+    return "옵션{" + "|".join(f"{chr(65 + index)} {part}" for index, part in enumerate(parts[:26])) + "}"
+
+
+def option_input_from_entry(entry: dict) -> str:
+    existing = text_value(entry.get("optionInput"))
+    if existing:
+        return existing
+    items = entry.get("optionItems") if isinstance(entry.get("optionItems"), list) else []
+    labels = [
+        text_value(item.get("option") if isinstance(item, dict) else item)
+        for item in items
+    ]
+    labels = [label for label in labels if label and label != "단일"]
+    if labels:
+        return "옵션{" + "|".join(f"{chr(65 + index)} {label}" for index, label in enumerate(labels[:26])) + "}"
+    return option_summary_to_input(entry.get("optionSummary"))
+
+
+def option_additionals_from_entry(entry: dict) -> str:
+    existing = entry.get("optionAdditionalAmounts")
+    if isinstance(existing, list) and existing:
+        return "|".join(str(int(parse_upload_price(value))) for value in existing)
+    items = entry.get("optionItems") if isinstance(entry.get("optionItems"), list) else []
+    if len(items) <= 1:
+        return ""
+    prices = [
+        parse_upload_price(item.get("salePrice") or item.get("price"))
+        for item in items
+        if isinstance(item, dict)
+    ]
+    if len(prices) <= 1 or not prices[0]:
+        return ""
+    base = prices[0]
+    return "|".join(str(price - base) for price in prices)
 
 
 def upload_image_src_to_path(src: object) -> Path | None:
@@ -2570,9 +2732,65 @@ def public_image_url(src: object) -> str:
     return ""
 
 
+def direct_upload_image_ref(src: object) -> str:
+    path = upload_image_src_to_path(src)
+    if path is not None:
+        return str(path)
+    return public_image_url(src)
+
+
+def seed_detail_images_for_gs(gs: object) -> list[str]:
+    gs_value = text_value(gs).upper()
+    if not gs_value:
+        return []
+    base_value = base_gs_code(gs_value)
+    for seed_path in sorted(SEED_ROOT.glob("*.webseed.json"), key=lambda path: path.stat().st_mtime, reverse=True):
+        seed = read_json(seed_path, {})
+        products = seed.get("products")
+        if not isinstance(products, list):
+            continue
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            product_gs = text_value(product.get("gs")).upper()
+            product_base = text_value(product.get("baseGs") or base_gs_code(product_gs)).upper()
+            if gs_value not in {product_gs, product_base} and base_value not in {product_gs, product_base}:
+                continue
+            images = product.get("images")
+            if not isinstance(images, dict):
+                return []
+            detail = images.get("detail")
+            if isinstance(detail, list):
+                return [text_value(url) for url in detail if text_value(url)]
+            return extract_image_urls(detail)
+    return []
+
+
+def seed_detail_html_for_gs(gs: object) -> str:
+    gs_value = text_value(gs).upper()
+    if not gs_value:
+        return ""
+    base_value = base_gs_code(gs_value)
+    for seed_path in sorted(SEED_ROOT.glob("*.webseed.json"), key=lambda path: path.stat().st_mtime, reverse=True):
+        seed = read_json(seed_path, {})
+        products = seed.get("products")
+        if not isinstance(products, list):
+            continue
+        for product in products:
+            if not isinstance(product, dict):
+                continue
+            product_gs = text_value(product.get("gs")).upper()
+            product_base = text_value(product.get("baseGs") or base_gs_code(product_gs)).upper()
+            if gs_value not in {product_gs, product_base} and base_value not in {product_gs, product_base}:
+                continue
+            return text_value(product.get("detailHtml"))
+    return ""
+
+
 def base_gs_code(gs: object) -> str:
     value = text_value(gs).upper()
-    return re.sub(r"[A-Z]$", "", value)
+    match = GS_CODE_RE.search(value)
+    return match.group(1).upper() if match else value
 
 
 def image_selection_for_entry(entry: dict) -> tuple[int | None, list[int]]:
@@ -2692,18 +2910,34 @@ def infer_direct_upload_categories(entry: dict) -> dict[str, str]:
     return out
 
 
-def write_direct_upload_workbook(job_id: str, entry: dict) -> Path:
-    try:
-        from openpyxl import Workbook
-    except Exception as exc:
-        raise RuntimeError(f"openpyxl 로드 실패: {exc}") from exc
+def upload_workbook_headers() -> list[str]:
+    return [
+        "상품코드", "자체 상품코드", "판매자내부상품번호", "상품명", "공급사 상품명",
+        "홈런_공통마켓상품명", "홈런_네이버상품명", "네이버상품명", "홈런_네이버태그", "네이버태그",
+        "홈런_쿠팡상품명", "쿠팡상품명", "홈런_쿠팡검색태그", "쿠팡검색태그",
+        "홈런_롯데ON상품명", "롯데ON상품명", "홈런_롯데ON검색키워드", "롯데ON검색키워드",
+        "네이버카테고리코드", "쿠팡카테고리코드", "롯데ON표준카테고리코드", "롯데ON전시카테고리코드", "롯데ON상품품목코드",
+        "11번가카테고리코드", "11번가카테고리코드/경로",
+        "ESM카테고리코드", "ESM카테고리코드/경로", "옥션카테고리코드", "G마켓카테고리코드",
+        "홈런_공통마켓검색키워드", "공통마켓검색키워드", "검색어설정", "검색키워드",
+        "판매가", "상품가", "소비자가", "옵션입력", "옵션추가금",
+        "이미지등록(목록)", "이미지등록(추가)", "이미지등록(상세)",
+        "상품 상세설명", "상세설명", "브랜드",
+    ]
 
-    file_name = safe_name(f"api_upload_{job_id}_{entry['channel']}_{entry['gs']}.xlsx")
-    target = EXPORT_ROOT / file_name
-    title = clean_product_title(entry.get("title")) or clean_product_title(entry.get("sourceName")) or entry["gs"]
+
+def build_upload_workbook_row(entry: dict) -> dict[str, object]:
+    title = clean_product_title(entry.get("title")) or clean_product_title(entry.get("sourceName")) or text_value(entry.get("gs"))
     search_terms = text_value(entry.get("searchTerms"))
-    price = parse_upload_price(entry.get("price")) or 1000
-    option_input = option_summary_to_input(entry.get("optionSummary"))
+    price = parse_upload_price(entry.get("salePrice") or entry.get("price")) or 1000
+    consumer_price = parse_upload_price(entry.get("consumerPrice")) or round_100(price * 1.2) or price
+    upload_images = [
+        url for url in [
+            direct_upload_image_ref(entry.get("mainImageSrc")),
+            *[direct_upload_image_ref(url) for url in entry.get("additionalImageSrcs", [])],
+        ]
+        if url
+    ]
     public_images = [
         url for url in [
             public_image_url(entry.get("mainImageSrc")),
@@ -2711,24 +2945,27 @@ def write_direct_upload_workbook(job_id: str, entry: dict) -> Path:
         ]
         if url
     ]
-    image_list = "|".join(public_images[:9])
-    detail_html = "상세페이지 참조"
-    if public_images:
-        detail_html = "<center>" + "".join(f'<img src="{url}">' for url in public_images[:12]) + "</center>"
-    categories = infer_direct_upload_categories(entry)
-
-    headers = [
-        "상품코드", "자체 상품코드", "판매자내부상품번호", "상품명", "공급사 상품명",
-        "홈런_공통마켓상품명", "홈런_네이버상품명", "네이버상품명", "홈런_네이버태그", "네이버태그",
-        "홈런_쿠팡상품명", "쿠팡상품명", "홈런_쿠팡검색태그", "쿠팡검색태그",
-        "홈런_롯데ON상품명", "롯데ON상품명", "홈런_롯데ON검색키워드", "롯데ON검색키워드",
-        "네이버카테고리코드", "쿠팡카테고리코드", "롯데ON표준카테고리코드", "롯데ON전시카테고리코드", "롯데ON상품품목코드",
-        "홈런_공통마켓검색키워드", "공통마켓검색키워드", "검색어설정", "검색키워드",
-        "판매가", "상품가", "소비자가", "옵션입력", "옵션추가금",
-        "이미지등록(목록)", "이미지등록(추가)", "이미지등록(상세)",
-        "상품 상세설명", "상세설명", "브랜드",
+    detail_sources = entry.get("detailImageSrcs") if isinstance(entry.get("detailImageSrcs"), list) else []
+    if not detail_sources:
+        detail_sources = seed_detail_images_for_gs(entry.get("gs"))
+    public_detail_images = [
+        public_image_url(url)
+        for url in detail_sources
+        if public_image_url(url)
     ]
-    row = {
+    image_list = "|".join(upload_images[:9])
+    detail_html = text_value(entry.get("detailHtml")) or seed_detail_html_for_gs(entry.get("gs"))
+    if detail_html and "<img" not in detail_html.lower() and public_detail_images:
+        detail_html = ""
+    if not detail_html and public_detail_images:
+        detail_html = "<center>" + "".join(f'<img src="{url}">' for url in public_detail_images[:80]) + "</center>"
+    elif not detail_html and public_images:
+        detail_html = "<center>" + "".join(f'<img src="{url}">' for url in public_images[:12]) + "</center>"
+    if not detail_html:
+        detail_html = "상세페이지 참조"
+
+    categories = infer_direct_upload_categories(entry)
+    return {
         "상품코드": entry["gs"],
         "자체 상품코드": entry["gs"],
         "판매자내부상품번호": entry["gs"],
@@ -2752,22 +2989,40 @@ def write_direct_upload_workbook(job_id: str, entry: dict) -> Path:
         "롯데ON표준카테고리코드": categories.get("lotte_standard", ""),
         "롯데ON전시카테고리코드": categories.get("lotte_display", ""),
         "롯데ON상품품목코드": categories.get("lotte_item", ""),
+        "11번가카테고리코드": categories.get("elevenst", ""),
+        "11번가카테고리코드/경로": categories.get("elevenst", ""),
+        "ESM카테고리코드": categories.get("esm", ""),
+        "ESM카테고리코드/경로": categories.get("esm", ""),
+        "옥션카테고리코드": categories.get("auction", ""),
+        "G마켓카테고리코드": categories.get("gmarket", ""),
         "홈런_공통마켓검색키워드": search_terms,
         "공통마켓검색키워드": search_terms,
         "검색어설정": search_terms,
         "검색키워드": search_terms,
         "판매가": price,
         "상품가": price,
-        "소비자가": price,
-        "옵션입력": option_input,
-        "옵션추가금": "",
+        "소비자가": consumer_price,
+        "옵션입력": option_input_from_entry(entry),
+        "옵션추가금": option_additionals_from_entry(entry),
         "이미지등록(목록)": image_list,
-        "이미지등록(추가)": "|".join(public_images[1:9]),
-        "이미지등록(상세)": "",
+        "이미지등록(추가)": "|".join(upload_images[1:9]),
+        "이미지등록(상세)": image_list,
         "상품 상세설명": detail_html,
         "상세설명": detail_html,
         "브랜드": "샤플라이",
     }
+
+
+def write_direct_upload_workbook(job_id: str, entry: dict) -> Path:
+    try:
+        from openpyxl import Workbook
+    except Exception as exc:
+        raise RuntimeError(f"openpyxl 로드 실패: {exc}") from exc
+
+    file_name = safe_name(f"api_upload_{job_id}_{entry['channel']}_{entry['gs']}.xlsx")
+    target = EXPORT_ROOT / file_name
+    headers = upload_workbook_headers()
+    row = build_upload_workbook_row(entry)
 
     workbook = Workbook()
     first = True
@@ -2838,6 +3093,8 @@ def market_key_overlay(account: str, market: str, settings: dict):
                 else:
                     overlay_file(source, "lotteon_api.txt")
                     overlay_file(source, "lotteon_upload_id.json", hide_only=True)
+            elif market == "Cafe24":
+                pass
             else:
                 raise ValueError(f"{market}은 API 업로드 대상이 아닙니다.")
 
@@ -2846,6 +3103,9 @@ def market_key_overlay(account: str, market: str, settings: dict):
                 cafe24_path = Path(cafe24_item.get("path", "")).resolve()
                 if cafe24_path.is_file() and is_within(MARKET_KEY_ROOT, cafe24_path):
                     overlay_file(cafe24_path, "cafe24_token_rkghrud1.json")
+                    overlay_file(cafe24_path, "cafe24_token.json")
+                    if account == "B":
+                        overlay_file(cafe24_path, "cafe24_token_jb.json")
             yield
         finally:
             for target, state, backup in reversed(restored):
@@ -2887,7 +3147,7 @@ def parse_direct_upload_result(entry: dict, exit_code: int, lines: list[str]) ->
     result[id_name] = product_id.strip()
     result["productId"] = product_id.strip()
     result["rawStatus"] = status_upper
-    if status_upper in {"OK", "DRY_RUN_OK", "DRY_RUN"}:
+    if status_upper in {"OK", "SUCCESS", "DRY_RUN_OK", "DRY_RUN"}:
         result["status"] = "uploaded"
     elif status_upper in {"SKIP_DUP"}:
         result["status"] = "skipped"
@@ -2929,26 +3189,61 @@ def execute_direct_market_upload(job_id: str, entry: dict, workbook_path: Path, 
     )
     register_active_process(job_id, process)
     lines: list[str] = []
+    output_queue: queue.Queue[str | None] = queue.Queue()
+
+    def read_stdout() -> None:
+        try:
+            assert process.stdout is not None
+            for raw_line in process.stdout:
+                output_queue.put(raw_line)
+        finally:
+            output_queue.put(None)
+
+    reader = threading.Thread(target=read_stdout, daemon=True)
+    reader.start()
+    started = time.monotonic()
+    exit_code = -1
     try:
-        assert process.stdout is not None
-        for line in process.stdout:
+        stream_closed = False
+        while True:
             if job_id in CANCELLED_JOB_IDS:
                 stop_process_tree(process)
+                exit_code = -1
                 break
-            clean = line.rstrip("\n")
-            lines.append(clean)
-            log.write(clean + "\n")
-            log.flush()
-            current = read_json(JOBS_ROOT / f"{job_id}.json", {"jobId": job_id})
-            current.update({
-                "status": "running",
-                "updatedAt": now_text(),
-                "currentStage": f"{entry['channel']} API 실행",
-                "tail": lines[-20:],
-                "results": results,
-            })
-            write_json(JOBS_ROOT / f"{job_id}.json", current)
-        exit_code = process.wait()
+            if time.monotonic() - started > MARKET_UPLOAD_TIMEOUT_SECONDS:
+                lines.append(f"TIMEOUT: {entry['channel']} {entry['gs']} API 업로드가 {MARKET_UPLOAD_TIMEOUT_SECONDS}초를 초과했습니다.")
+                stop_process_tree(process)
+                exit_code = -1
+                break
+            try:
+                item = output_queue.get(timeout=0.5)
+            except queue.Empty:
+                if process.poll() is not None and stream_closed:
+                    exit_code = process.returncode
+                    break
+                continue
+            if item is None:
+                stream_closed = True
+                if process.poll() is not None:
+                    exit_code = process.returncode
+                    break
+                continue
+            clean = item.rstrip("\n")
+            if clean:
+                lines.append(clean)
+                log.write(clean + "\n")
+                log.flush()
+                current = read_json(JOBS_ROOT / f"{job_id}.json", {"jobId": job_id})
+                current.update({
+                    "status": "running",
+                    "updatedAt": now_text(),
+                    "currentStage": f"{entry['channel']} API 실행",
+                    "tail": lines[-20:],
+                    "results": results,
+                })
+                write_json(JOBS_ROOT / f"{job_id}.json", current)
+        if exit_code == -1 and process.poll() is not None and not any(line.startswith("TIMEOUT:") for line in lines):
+            exit_code = process.returncode
     finally:
         unregister_active_process(job_id, process)
     return parse_direct_upload_result(entry, exit_code, lines), lines
@@ -3038,15 +3333,185 @@ def run_market_upload_job(job_id: str, payload: dict) -> None:
         write_json(job_path, job)
 
 
+def find_active_market_upload_job() -> str:
+    for path in sorted(JOBS_ROOT.glob("*.json"), key=lambda item: item.stat().st_mtime, reverse=True):
+        try:
+            if time.time() - path.stat().st_mtime > 7200:
+                continue
+            job = read_json(path, {})
+        except Exception:
+            continue
+        if job.get("action") == "marketUpload" and job.get("status") in {"queued", "running"}:
+            return text_value(job.get("jobId") or path.stem)
+    return ""
+
+
+def export_file_url(path: Path) -> str:
+    try:
+        rel = path.resolve().relative_to(EXPORT_ROOT.resolve())
+        rel_text = str(rel).replace("\\", "/")
+        return f"/data/exports/{urllib.parse.quote(rel_text, safe='/')}"
+    except Exception:
+        return f"/data/exports/{urllib.parse.quote(path.name)}"
+
+
+def write_official_market_export_source(entries: list[dict], market: str, stamp: str) -> Path:
+    try:
+        from openpyxl import Workbook
+    except Exception as exc:
+        raise RuntimeError(f"openpyxl 로드 실패: {exc}") from exc
+
+    source_dir = EXPORT_ROOT / safe_name(f"{market}_official_source_{stamp}", "official_source")
+    source_dir.mkdir(parents=True, exist_ok=True)
+    listing_root = source_dir / "listing_images"
+    listing_root.mkdir(parents=True, exist_ok=True)
+    source_path = source_dir / "market_export_source.xlsx"
+    headers = upload_workbook_headers()
+
+    selection_payload: dict[str, object] = {}
+    nested: dict[str, object] = {}
+
+    for entry in entries:
+        gs_base = base_gs_code(entry.get("gs"))
+        if not gs_base:
+            continue
+        gs_folder = listing_root / gs_base
+        gs_folder.mkdir(parents=True, exist_ok=True)
+        image_sources = [
+            entry.get("mainImageSrc"),
+            *(
+                entry.get("additionalImageSrcs")
+                if isinstance(entry.get("additionalImageSrcs"), list)
+                else []
+            ),
+        ]
+        copied_count = 0
+        for index, src in enumerate(image_sources):
+            source_path_value = upload_image_src_to_path(src)
+            if source_path_value is None or not source_path_value.exists():
+                continue
+            suffix = source_path_value.suffix.lower()
+            if suffix not in IMAGE_EXTENSIONS:
+                suffix = ".jpg"
+            name = f"{index:03d}_{'main' if index == 0 else 'add'}{suffix}"
+            shutil.copy2(source_path_value, gs_folder / name)
+            copied_count += 1
+        if copied_count > 0:
+            selection = {"main": 0, "additional": list(range(1, copied_count))}
+            selection_payload[gs_base[:9]] = selection
+            nested[gs_base[:9]] = selection
+
+    if nested:
+        selection_payload["image_selections"] = nested
+        write_json(source_dir / "image_selections.json", selection_payload)
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "분리추출후"
+    sheet.append(headers)
+    for entry in entries:
+        row = build_upload_workbook_row(entry)
+        sheet.append([row.get(header, "") for header in headers])
+    workbook.save(source_path)
+    return source_path
+
+
+def parse_market_excel_files(lines: list[str]) -> list[dict]:
+    result: list[dict] = []
+    known_markets = ["11번가 이미지ZIP", "11번가", "ESM"]
+    for line in lines:
+        if not line.startswith("MARKET_EXCEL_FILE "):
+            continue
+        tail = line.replace("MARKET_EXCEL_FILE ", "", 1).strip()
+        for market in known_markets:
+            prefix = f"{market} "
+            if tail.startswith(prefix):
+                path = Path(tail[len(prefix):].strip())
+                result.append({
+                    "market": market,
+                    "fileName": path.name,
+                    "path": str(path),
+                    "url": export_file_url(path),
+                })
+                break
+    return result
+
+
+def write_official_market_export(payload: dict, entries: list[dict], market: str, stamp: str) -> dict:
+    source_path = write_official_market_export_source(entries, market, stamp)
+    selected_gs = ",".join(sorted({text_value(entry.get("gs")) for entry in entries if text_value(entry.get("gs"))}))
+    if not selected_gs:
+        raise ValueError("export GS list empty")
+    account = text_value(entries[0].get("account")).upper() or "A"
+    settings = read_market_key_settings().get("items", {})
+    cmd = [
+        "dotnet", "run",
+        "--project", str(DOTNET_UPLOAD_PROJECT),
+        "--",
+        "--export-market-excel",
+        "--source", str(source_path),
+        "--gs", selected_gs,
+        "--project-root", str(PROJECT_ROOT),
+    ]
+    cafe24_key = market_key_id(account, "Cafe24")
+    overlay_context = market_key_overlay(account, "Cafe24", settings) if cafe24_key in settings else nullcontext()
+    with overlay_context:
+        completed = subprocess.run(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=MARKET_UPLOAD_TIMEOUT_SECONDS,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+
+    lines = [
+        line.strip()
+        for line in (completed.stdout + "\n" + completed.stderr).splitlines()
+        if line.strip()
+    ]
+    if completed.returncode != 0:
+        raise RuntimeError(scrub_secret("\n".join(lines[-40:]) or f"dotnet exit code {completed.returncode}", 1200))
+
+    files = parse_market_excel_files(lines)
+    primary = next((file for file in files if file.get("market") == market), None)
+    if not primary:
+        raise RuntimeError("공식 마켓 엑셀 결과 파일을 찾지 못했습니다.")
+    related = [
+        file for file in files
+        if file.get("market") == market or (market == "11번가" and file.get("market") == "11번가 이미지ZIP")
+    ]
+    return {
+        **primary,
+        "count": len(entries),
+        "format": Path(primary["path"]).suffix.lstrip(".") or "xlsx",
+        "sourcePath": str(source_path),
+        "files": related,
+        "officialTemplate": True,
+        "stdoutTail": lines[-20:],
+    }
+
+
 def write_market_export(payload: dict) -> dict:
     entries = normalize_upload_entries(payload)
     market = safe_name(text_value(payload.get("market") or "market"), "market")
     if not entries:
         raise ValueError("export entries empty")
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    if market in {"11번가", "ESM"}:
+        try:
+            return write_official_market_export(payload, entries, market, stamp)
+        except Exception as exc:
+            fallback_reason = str(exc)
+    else:
+        fallback_reason = ""
     headers = [
         "계정", "마켓", "GS코드", "원본상품명", "업로드상품명", "검색어설정",
-        "대표이미지", "대표이미지URL", "추가이미지URL", "Cafe24 URL", "상태",
+        "판매가", "소비자가", "옵션입력", "옵션추가금",
+        "대표이미지", "이미지등록(목록)", "이미지등록(추가)", "이미지등록(상세)",
+        "상품 상세설명", "Cafe24 URL", "상태",
     ]
     try:
         from openpyxl import Workbook
@@ -3058,6 +3523,16 @@ def write_market_export(payload: dict) -> dict:
         sheet.title = market[:31]
         sheet.append(headers)
         for entry in entries:
+            price = parse_upload_price(entry.get("salePrice") or entry.get("price"))
+            consumer_price = parse_upload_price(entry.get("consumerPrice")) or round_100(price * 1.2)
+            main_image = direct_upload_image_ref(entry.get("mainImageSrc"))
+            add_images = [direct_upload_image_ref(url) for url in entry.get("additionalImageSrcs", [])]
+            add_images = [url for url in add_images if url]
+            detail_html = text_value(entry.get("detailHtml")) or seed_detail_html_for_gs(entry.get("gs"))
+            if not detail_html:
+                detail_urls = [public_image_url(url) for url in entry.get("detailImageSrcs", []) if public_image_url(url)]
+                if detail_urls:
+                    detail_html = "<center>" + "".join(f'<img src="{url}">' for url in detail_urls[:80]) + "</center>"
             sheet.append([
                 entry["account"],
                 entry["market"],
@@ -3065,9 +3540,16 @@ def write_market_export(payload: dict) -> dict:
                 entry["sourceName"],
                 entry["title"],
                 entry["searchTerms"],
+                price,
+                consumer_price,
+                option_input_from_entry(entry),
+                option_additionals_from_entry(entry),
                 entry["mainImage"],
-                entry["mainImageSrc"],
-                "\n".join(entry.get("additionalImageSrcs", [])),
+                main_image,
+                main_image,
+                "\n".join(add_images),
+                "|".join([main_image, *add_images]) if main_image else "",
+                detail_html,
                 entry["cafe24Url"],
                 "대기",
             ])
@@ -3080,6 +3562,12 @@ def write_market_export(payload: dict) -> dict:
             writer = csv.writer(handle)
             writer.writerow(headers)
             for entry in entries:
+                price = parse_upload_price(entry.get("salePrice") or entry.get("price"))
+                consumer_price = parse_upload_price(entry.get("consumerPrice")) or round_100(price * 1.2)
+                main_image = direct_upload_image_ref(entry.get("mainImageSrc"))
+                add_images = [direct_upload_image_ref(url) for url in entry.get("additionalImageSrcs", [])]
+                add_images = [url for url in add_images if url]
+                detail_html = text_value(entry.get("detailHtml")) or seed_detail_html_for_gs(entry.get("gs"))
                 writer.writerow([
                     entry["account"],
                     entry["market"],
@@ -3087,9 +3575,16 @@ def write_market_export(payload: dict) -> dict:
                     entry["sourceName"],
                     entry["title"],
                     entry["searchTerms"],
+                    price,
+                    consumer_price,
+                    option_input_from_entry(entry),
+                    option_additionals_from_entry(entry),
                     entry["mainImage"],
-                    entry["mainImageSrc"],
-                    "\n".join(entry.get("additionalImageSrcs", [])),
+                    main_image,
+                    main_image,
+                    "\n".join(add_images),
+                    "|".join([main_image, *add_images]) if main_image else "",
+                    detail_html,
                     entry["cafe24Url"],
                     "대기",
                 ])
@@ -3097,9 +3592,11 @@ def write_market_export(payload: dict) -> dict:
     return {
         "fileName": file_name,
         "path": str(target),
-        "url": f"/data/exports/{urllib.parse.quote(file_name)}",
+        "url": export_file_url(target),
         "count": len(entries),
         "format": file_format,
+        "officialTemplate": False,
+        "fallbackReason": fallback_reason,
     }
 
 
@@ -3243,6 +3740,9 @@ class WebOcrHandler(SimpleHTTPRequestHandler):
             if path == "/api/keyword-generate":
                 self.handle_keyword_generate()
                 return
+            if path == "/api/job-stop":
+                self.handle_job_stop()
+                return
             if path == "/api/market-upload":
                 self.handle_market_upload()
                 return
@@ -3369,22 +3869,53 @@ class WebOcrHandler(SimpleHTTPRequestHandler):
         thread.start()
         self.send_json(job, 202)
 
-    def handle_market_upload(self) -> None:
+    def handle_job_stop(self) -> None:
         payload = json.loads(self.read_body().decode("utf-8", errors="replace") or "{}")
-        job_id = uuid.uuid4().hex[:12]
+        job_id = text_value(payload.get("jobId"))
+        if not job_id:
+            self.send_json({"ok": False, "error": "jobId required"}, 400)
+            return
+        stopped = stop_active_job(job_id)
         job_path = JOBS_ROOT / f"{job_id}.json"
-        job = {
+        job = read_json(job_path, {"jobId": job_id})
+        job.update({
             "ok": True,
             "jobId": job_id,
-            "action": "marketUpload",
-            "status": "queued",
-            "createdAt": now_text(),
-            "progressPercent": 1,
-            "currentStage": "업로드 대기",
-        }
+            "status": "cancelled",
+            "finishedAt": now_text(),
+            "currentStage": "사용자 중지",
+            "stopped": stopped,
+        })
         write_json(job_path, job)
-        thread = threading.Thread(target=run_market_upload_job, args=(job_id, payload), daemon=True)
-        thread.start()
+        self.send_json({"ok": True, "jobId": job_id, "stopped": stopped})
+
+    def handle_market_upload(self) -> None:
+        payload = json.loads(self.read_body().decode("utf-8", errors="replace") or "{}")
+        with ACTIVE_MARKET_UPLOAD_LOCK:
+            active_job_id = find_active_market_upload_job()
+            if active_job_id:
+                self.send_json({
+                    "ok": True,
+                    "jobId": active_job_id,
+                    "deduped": True,
+                    "status": "running",
+                    "currentStage": "기존 업로드 작업 진행 중",
+                }, 202)
+                return
+            job_id = uuid.uuid4().hex[:12]
+            job_path = JOBS_ROOT / f"{job_id}.json"
+            job = {
+                "ok": True,
+                "jobId": job_id,
+                "action": "marketUpload",
+                "status": "queued",
+                "createdAt": now_text(),
+                "progressPercent": 1,
+                "currentStage": "업로드 대기",
+            }
+            write_json(job_path, job)
+            thread = threading.Thread(target=run_market_upload_job, args=(job_id, payload), daemon=True)
+            thread.start()
         self.send_json(job, 202)
 
     def handle_excel_export(self) -> None:

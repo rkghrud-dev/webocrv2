@@ -50,6 +50,7 @@ GET  /api/jobs/{jobId}
 - `data/exports/`: 기존 파이프라인 실행 결과 루트
 - `docs/KEYWORD_V4_PIPELINE_FLOW.md`: 기존 KeywordOCR V4 파이프라인과 코드 매칭표
 - `docs/WEBOCRV2_PIPELINE_MATCHING.md`: 새 화면 버튼별 실제 실행 매칭표
+- `docs/NAVER_PROVIDED_NOTICE_OCR.md`: OCR 결과를 네이버 상품정보제공고시에 매칭하는 기준
 
 ## 작업 원칙
 

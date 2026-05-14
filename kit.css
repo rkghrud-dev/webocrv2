@@ -2266,6 +2266,108 @@ input[type="checkbox"] {
   font: 800 10px var(--font-sans);
 }
 
+.upload-result-table {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  background: rgba(255,255,255,.92);
+  overflow: hidden;
+}
+.result-grid-wrap {
+  overflow: auto;
+  border: 1px solid var(--border-subtle);
+  border-radius: 10px;
+  background: #fff;
+}
+.result-grid {
+  display: grid;
+  min-width: max-content;
+}
+.result-head-cell {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  min-height: 38px;
+  padding: 10px 12px;
+  border-right: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  background: rgba(246,247,251,.98);
+  color: var(--color-quizlet-violet);
+  font: 900 11px var(--font-sans);
+}
+.result-product-cell {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  min-height: 78px;
+  padding: 9px 10px;
+  border-right: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  background: #fff;
+}
+.result-product-cell span {
+  display: grid;
+  gap: 2px;
+  min-width: 0;
+}
+.result-product-cell strong {
+  color: var(--color-quizlet-violet);
+  font-size: 11px;
+}
+.result-product-cell small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-1);
+  font: 800 12px var(--font-sans);
+}
+.result-market-cell {
+  display: grid;
+  align-content: center;
+  gap: 5px;
+  min-height: 78px;
+  padding: 9px 10px;
+  border-right: 1px solid var(--border-subtle);
+  border-bottom: 1px solid var(--border-subtle);
+  background: #fff;
+}
+.result-market-cell.is-uploaded {
+  background: rgba(66,85,255,.045);
+}
+.result-market-cell.is-failed {
+  background: rgba(255,82,112,.07);
+}
+.result-market-cell.is-running {
+  background: rgba(152,227,255,.10);
+}
+.result-market-cell small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--fg-3);
+  font: 800 10px var(--font-sans);
+}
+.result-error {
+  color: #d92d48 !important;
+}
+.result-market-cell button {
+  justify-self: start;
+  padding: 4px 9px;
+  border: 1px solid rgba(66,85,255,.28);
+  border-radius: 999px;
+  background: #fff;
+  color: var(--color-quizlet-violet);
+  font: 900 11px var(--font-sans);
+  cursor: pointer;
+}
+.result-market-cell button:disabled {
+  opacity: .5;
+  cursor: default;
+}
+
 /* ── Keyword options modal ───────────────────────────────── */
 .keyword-options-modal {
   width: min(980px, 100%);
