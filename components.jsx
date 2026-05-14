@@ -77,6 +77,34 @@ const KEYWORD_POOL_LABELS = {
   synonyms: '동의어/현장명',
 };
 
+const NOTICE_FIELD_LABELS = {
+  itemName: '품명',
+  modelName: '모델명',
+  material: '소재',
+  quantity: '수량',
+  color: '색상',
+  size: '사이즈',
+  sizeDetail: '상세 치수',
+  importer: '수입사',
+  manufacturer: '제조자/수입자',
+  origin: '제조국',
+  customerServicePhoneNumber: 'A/S 연락처',
+  returnCostReason: '반품 비용',
+  noRefundReason: '청약철회 제한',
+  qualityAssuranceStandard: '품질보증기준',
+  compensationProcedure: '보상 절차',
+  troubleShootingContents: '분쟁 처리',
+  warrantyPolicy: '품질보증',
+  afterServiceDirector: 'A/S 책임자',
+  caution: '취급 주의',
+  height: '굽높이',
+  type: '종류',
+};
+
+function noticeFieldLabel(key) {
+  return NOTICE_FIELD_LABELS[key] || key;
+}
+
 function formatWon(value) {
   const amount = Number(value || 0);
   return amount ? `₩${amount.toLocaleString()}` : '가격 없음';
@@ -513,6 +541,14 @@ function SeedPreviewModal({ row, tab, onTab, onClose }) {
   const ocr = product.ocrAnalysis || {};
   const ocrFields = ocr.fields || {};
   const keywordPool = product.keywordCandidatePool || {};
+  const notice = product.naverProvidedNotice || row?.naverProvidedNotice || {};
+  const noticePayload = notice.productInfoProvidedNotice || {};
+  const noticeType = notice.productInfoProvidedNoticeType || noticePayload.productInfoProvidedNoticeType || '-';
+  const noticeObjectKey = notice.objectKey || Object.keys(noticePayload).find((key) => key !== 'productInfoProvidedNoticeType') || '';
+  const noticeObject = noticeObjectKey ? (noticePayload[noticeObjectKey] || {}) : {};
+  const matchedNoticeFields = notice.matchedFields || {};
+  const extractedNoticeFields = notice.extractedFields || {};
+  const noticeNeedsReview = Array.isArray(notice.needsReview) ? notice.needsReview : [];
   const optionMeta = getOptionMeta(row);
   const optionRows = optionMeta.items.length
     ? optionMeta.items
@@ -522,6 +558,7 @@ function SeedPreviewModal({ row, tab, onTab, onClose }) {
   const tabs = [
     ['summary', '정리 데이터'],
     ['ocr', 'OCR 분석'],
+    ['notice', '상품고시'],
     ['keywords', '후보 풀'],
     ['price', '가격/옵션'],
   ];
@@ -580,6 +617,59 @@ function SeedPreviewModal({ row, tab, onTab, onClose }) {
               </div>
               <pre className="ocr-text-box">{rawOcrText || 'OCR 원문이 아직 저장되지 않았습니다.'}</pre>
             </>
+          )}
+
+          {tab === 'notice' && (
+            <div className="keyword-preview-list">
+              <div className="seed-data-grid seed-data-grid--compact">
+                <div><span>상태</span><strong>{notice.status === 'matched' ? '매칭됨' : notice.status === 'partial' ? '검수 필요' : '후보 없음'}</strong></div>
+                <div><span>고시 상품군</span><strong className="mono">{noticeType}</strong></div>
+                <div><span>객체 키</span><strong className="mono">{noticeObjectKey || '-'}</strong></div>
+                <div><span>소스</span><strong>{notice.source || 'ocr_label_match'}</strong></div>
+              </div>
+
+              <div className="keyword-preview-row">
+                <strong>OCR 매칭값</strong>
+                <div className="keyword-tags">
+                  {Object.keys(matchedNoticeFields).length
+                    ? Object.entries(matchedNoticeFields).map(([key, value]) => (
+                      <span key={key}>{noticeFieldLabel(key)} · {value}</span>
+                    ))
+                    : <em>매칭된 고시값 없음</em>}
+                </div>
+              </div>
+
+              <div className="keyword-preview-row">
+                <strong>추출 원본값</strong>
+                <div className="keyword-tags">
+                  {Object.keys(extractedNoticeFields).length
+                    ? Object.entries(extractedNoticeFields).map(([key, value]) => (
+                      <span key={key}>{noticeFieldLabel(key)} · {value}</span>
+                    ))
+                    : <em>추출된 라벨값 없음</em>}
+                </div>
+              </div>
+
+              <div className="keyword-preview-row">
+                <strong>네이버 후보</strong>
+                <div className="keyword-tags">
+                  {Object.keys(noticeObject).length
+                    ? Object.entries(noticeObject).map(([key, value]) => (
+                      <span key={key}>{noticeFieldLabel(key)} · {value}</span>
+                    ))
+                    : <em>payload 후보 없음</em>}
+                </div>
+              </div>
+
+              {noticeNeedsReview.length > 0 && (
+                <div className="keyword-preview-row">
+                  <strong>검수 필요</strong>
+                  <div className="keyword-tags">
+                    {noticeNeedsReview.map((value, index) => <span key={index}>{value}</span>)}
+                  </div>
+                </div>
+              )}
+            </div>
           )}
 
           {tab === 'keywords' && (
@@ -1685,6 +1775,7 @@ function KeywordWorkbench({
           thumb: row.thumb,
           price: row.price,
           optionSummary: row.opt,
+          naverProvidedNotice: row.seedProduct?.naverProvidedNotice || row.naverProvidedNotice || null,
         });
       });
     });
@@ -1971,6 +2062,7 @@ function MarketUploadWorkbench({
     thumb: queuedItems.find((item) => item.gs === gs)?.thumb || '',
     price: queuedItems.find((item) => item.gs === gs)?.price || 0,
     opt: queuedItems.find((item) => item.gs === gs)?.optionSummary || '',
+    naverProvidedNotice: queuedItems.find((item) => item.gs === gs)?.naverProvidedNotice || null,
     marketKeywords: {},
   });
   const getCellKey = (row, channel) => `${channel.key}:${row.gs}`;
@@ -2064,20 +2156,26 @@ function MarketUploadWorkbench({
     const payload = {
       action,
       createdAt: new Date().toISOString(),
-      rows: entries.map(({ key, row, channel, variant }) => ({
-        queueKey: key,
-        account: channel.account,
-        market: channel.market,
-        channel: channel.key,
-        gs: row.gs,
-        sourceName: row.name,
-        title: variant.title,
-        searchTerms: variant.searchTerms,
-        mainImage: variant.mainImageLabel,
-        mainImageSrc: variant.mainImageSrc,
-        additionalImageSrcs: variant.additionalImageSrcs || [],
-        cafe24Url: variant.cafe24Url,
-      })),
+      rows: entries.map(({ key, row, channel, variant }) => {
+        const queued = queuedItemMap.get(key);
+        return {
+          queueKey: key,
+          account: channel.account,
+          market: channel.market,
+          channel: channel.key,
+          gs: row.gs,
+          sourceName: row.name,
+          title: variant.title,
+          searchTerms: variant.searchTerms,
+          mainImage: variant.mainImageLabel,
+          mainImageSrc: variant.mainImageSrc,
+          additionalImageSrcs: variant.additionalImageSrcs || [],
+          cafe24Url: variant.cafe24Url,
+          price: row.price || queued?.price || 0,
+          optionSummary: row.opt || queued?.optionSummary || '',
+          naverProvidedNotice: queued?.naverProvidedNotice || row.seedProduct?.naverProvidedNotice || row.naverProvidedNotice || null,
+        };
+      }),
     };
     try {
       localStorage.setItem('webocr.pipeline.marketUpload', JSON.stringify(payload, null, 2));

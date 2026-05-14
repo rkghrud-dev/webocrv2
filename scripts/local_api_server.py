@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+from contextlib import contextmanager
 import csv
 import hashlib
 import hmac
@@ -14,6 +15,7 @@ import ssl
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -38,6 +40,8 @@ SEED_ROOT = DATA_ROOT / "seeds"
 EXPORT_ROOT = DATA_ROOT / "exports"
 MARKET_KEY_ROOT = DATA_ROOT / "market_keys"
 MARKET_KEY_SETTINGS = MARKET_KEY_ROOT / "settings.json"
+DOTNET_UPLOAD_PROJECT = PROJECT_ROOT / "KeywordOcr.App.Tests" / "KeywordOcr.App.Tests.csproj"
+DESKTOP_KEY_ROOT = Path.home() / "Desktop" / "key"
 
 for directory in (UPLOAD_ROOT, LOGO_ROOT, JOBS_ROOT, SEED_ROOT, EXPORT_ROOT, MARKET_KEY_ROOT):
     directory.mkdir(parents=True, exist_ok=True)
@@ -45,6 +49,7 @@ for directory in (UPLOAD_ROOT, LOGO_ROOT, JOBS_ROOT, SEED_ROOT, EXPORT_ROOT, MAR
 ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
 ACTIVE_PROCESS_LOCK = threading.Lock()
 CANCELLED_JOB_IDS: set[str] = set()
+MARKET_KEY_OVERLAY_LOCK = threading.Lock()
 
 
 KEYWORD_POOL_CATEGORIES = [
@@ -815,6 +820,235 @@ def split_candidate_terms(*values: object) -> list[str]:
     return unique_terms(terms)
 
 
+NOTICE_COMMON_DEFAULTS = {
+    "returnCostReason": "0",
+    "noRefundReason": "0",
+    "qualityAssuranceStandard": "0",
+    "compensationProcedure": "0",
+    "troubleShootingContents": "0",
+}
+
+NOTICE_REVIEW_DEFAULTS = {
+    "warrantyPolicy": "0",
+    "afterServiceDirector": "0",
+    "caution": "0",
+}
+
+NOTICE_FIELD_LABELS = [
+    "소재", "재질", "수량", "색상", "사이즈", "수입사", "수입원", "제조사",
+    "제조자", "제조원", "제조국", "원산지", "A/S", "AS", "고객센터",
+]
+
+NOTICE_NOISE_PATTERNS = [
+    re.compile(r"^(?:high|bullet|advantage|product\s*profile|size)$", re.IGNORECASE),
+    re.compile(r"^(?:in/mm|on|off|zero)$", re.IGNORECASE),
+    re.compile(r"^[{}\"']+$"),
+    re.compile(r"^\d{1,4}$"),
+    re.compile(r"^\d{1,4}\s*mm$", re.IGNORECASE),
+]
+
+
+def clean_notice_value(value: object, max_length: int = 160) -> str:
+    text = text_value(value)
+    text = re.sub(r"[{}\"`]+", " ", text)
+    text = re.sub(r"\s+", " ", text).strip(" ,./|·:-")
+    text = re.split(
+        r"\s+(?:홈런마켓|급배송|평일|택배사|구매대행|국내|모든\s*제품|상품/대량구매|대량구매|퀵서비스|방문수령)\b",
+        text,
+        maxsplit=1,
+    )[0].strip(" ,./|·:-")
+    return text[:max_length].strip()
+
+
+def notice_is_noise_line(value: object) -> bool:
+    text = clean_notice_value(value, max_length=80)
+    if not text:
+        return True
+    return any(pattern.search(text) for pattern in NOTICE_NOISE_PATTERNS)
+
+
+def ocr_notice_lines(raw_text: str) -> list[str]:
+    lines: list[str] = []
+    for raw_line in text_value(raw_text).splitlines():
+        line = clean_notice_value(raw_line, max_length=220)
+        if line:
+            lines.append(line)
+    return lines
+
+
+def extract_labeled_notice_value(lines: list[str], labels: list[str], stop_labels: list[str] | None = None) -> str:
+    stop_labels = stop_labels or NOTICE_FIELD_LABELS
+    label_pattern = "|".join(re.escape(label) for label in labels)
+    stop_pattern = "|".join(re.escape(label) for label in stop_labels if label not in labels)
+    joined = " ".join(lines)
+    match = re.search(
+        rf"(?:^|\s)(?:{label_pattern})\s*[:：]?\s*(.+?)(?=\s+(?:{stop_pattern})\s*[:：]?|\s+(?:SIZE|Product Profile|홈런마켓|급배송)\b|$)",
+        joined,
+        re.IGNORECASE,
+    )
+    if match:
+        value = clean_notice_value(match.group(1))
+        if value and not notice_is_noise_line(value):
+            return value
+
+    exact_pattern = re.compile(rf"^(?:{label_pattern})\s*[:：]?$", re.IGNORECASE)
+    inline_pattern = re.compile(rf"^(?:{label_pattern})\s*[:：]?\s*(.+)$", re.IGNORECASE)
+    stop_line_pattern = re.compile(rf"^(?:{'|'.join(re.escape(label) for label in stop_labels)})\b", re.IGNORECASE)
+    for index, line in enumerate(lines):
+        inline = inline_pattern.search(line)
+        if inline:
+            value = clean_notice_value(inline.group(1))
+            if value and not notice_is_noise_line(value):
+                return value
+        if exact_pattern.search(line):
+            for next_line in lines[index + 1:index + 4]:
+                if stop_line_pattern.search(next_line):
+                    break
+                if not notice_is_noise_line(next_line):
+                    return clean_notice_value(next_line)
+    return ""
+
+
+def normalize_notice_size(raw_size: str, option_items: list[dict]) -> str:
+    option_labels = [
+        clean_notice_value(item.get("option"))
+        for item in option_items or []
+        if clean_notice_value(item.get("option")) and clean_notice_value(item.get("option")) != "단일"
+    ]
+    if option_labels:
+        return " / ".join(unique_terms(option_labels[:20]))
+
+    text = clean_notice_value(raw_size, max_length=240)
+    text = re.split(r"\s+-?\s*위\s*\d*종|\s+수입사|\s+제조국|\s+SIZE\b", text, maxsplit=1, flags=re.IGNORECASE)[0]
+    numbers = re.findall(r"(?<!\d)(?:[A-Z]\s*)?(\d{2,4})(?!\d)", text, flags=re.IGNORECASE)
+    shoe_sizes = [number for number in numbers if 150 <= int(number) <= 350]
+    if shoe_sizes:
+        return " / ".join(unique_terms(shoe_sizes))
+    return clean_notice_value(text)
+
+
+def extract_notice_dimensions(raw_text: str) -> list[str]:
+    values = re.findall(r"\b[A-Z]?\s*\d{2,4}\s*-\s*\d{1,4}\s*mm\s*[xX]\s*\d{1,4}\s*mm\b", raw_text, flags=re.IGNORECASE)
+    return unique_terms([clean_notice_value(value).replace(" x ", "X").replace("x", "X") for value in values])[:12]
+
+
+def infer_notice_type(row: dict, extracted: dict[str, str], raw_text: str) -> tuple[str, str]:
+    joined = " ".join([
+        text_value(row.get("name")),
+        text_value(row.get("opt")),
+        text_value(raw_text),
+    ])
+    if re.search(r"깔창|인솔|신발|운동화|구두|슬리퍼|부츠", joined):
+        return "SHOES", "shoes"
+    if re.search(r"가방|백팩|파우치|숄더백|토트백", joined):
+        return "BAG", "bag"
+    if re.search(r"의류|티셔츠|셔츠|바지|자켓|재킷|점퍼|원피스|스커트", joined):
+        return "WEAR", "wear"
+    return "ETC", "etc"
+
+
+def build_naver_provided_notice(row: dict, ocr_record: dict) -> dict:
+    fields = ocr_record.get("fields", {}) if isinstance(ocr_record, dict) else {}
+    raw_text = text_value(ocr_record.get("rawText")) or text_value(fields.get("OCR텍스트"))
+    lines = ocr_notice_lines(raw_text)
+    source_name = clean_product_title(row.get("name")) or clean_notice_value(fields.get("상품명")) or text_value(row.get("gs"))
+    option_items = row.get("optionItems", []) if isinstance(row.get("optionItems"), list) else []
+
+    extracted = {
+        "itemName": source_name,
+        "modelName": text_value(row.get("gs")) or text_value(row.get("baseGs")),
+        "material": extract_labeled_notice_value(lines, ["소재", "재질"]),
+        "quantity": extract_labeled_notice_value(lines, ["수량"]),
+        "color": extract_labeled_notice_value(lines, ["색상"]),
+        "size": normalize_notice_size(extract_labeled_notice_value(lines, ["사이즈"]), option_items),
+        "importer": extract_labeled_notice_value(lines, ["수입사", "수입원"]),
+        "manufacturer": extract_labeled_notice_value(lines, ["제조사", "제조자", "제조원"]),
+        "origin": extract_labeled_notice_value(lines, ["제조국", "원산지"]),
+        "customerServicePhoneNumber": extract_labeled_notice_value(lines, ["A/S", "AS", "고객센터"]),
+    }
+    dimensions = extract_notice_dimensions(raw_text)
+    if dimensions:
+        extracted["sizeDetail"] = " / ".join(dimensions)
+    extracted = {key: value for key, value in extracted.items() if value}
+
+    notice_type, object_key = infer_notice_type(row, extracted, raw_text)
+    manufacturer = extracted.get("manufacturer") or extracted.get("importer") or "상품상세 참조"
+    material = extracted.get("material") or "상품상세 참조"
+    color = extracted.get("color") or "상품상세 참조"
+    size = extracted.get("size") or extracted.get("sizeDetail") or "상품상세 참조"
+
+    if notice_type == "SHOES":
+        detail = {
+            **NOTICE_COMMON_DEFAULTS,
+            **NOTICE_REVIEW_DEFAULTS,
+            "material": material,
+            "color": color,
+            "size": size,
+            "height": "해당사항 없음",
+            "manufacturer": manufacturer,
+        }
+    elif notice_type == "WEAR":
+        detail = {
+            **NOTICE_COMMON_DEFAULTS,
+            **NOTICE_REVIEW_DEFAULTS,
+            "material": material,
+            "color": color,
+            "size": size,
+            "manufacturer": manufacturer,
+        }
+    elif notice_type == "BAG":
+        detail = {
+            **NOTICE_COMMON_DEFAULTS,
+            **NOTICE_REVIEW_DEFAULTS,
+            "type": source_name,
+            "material": material,
+            "color": color,
+            "size": size,
+            "manufacturer": manufacturer,
+        }
+    else:
+        detail = {
+            **NOTICE_COMMON_DEFAULTS,
+            "itemName": source_name,
+            "modelName": extracted.get("modelName") or text_value(row.get("baseGs")) or source_name,
+            "manufacturer": manufacturer,
+            "customerServicePhoneNumber": extracted.get("customerServicePhoneNumber") or "상품상세 참조",
+        }
+
+    needs_review: list[str] = []
+    if extracted.get("importer") and not extracted.get("manufacturer"):
+        needs_review.append("수입사를 제조자/수입자로 임시 사용했습니다.")
+    if not extracted.get("customerServicePhoneNumber"):
+        needs_review.append("A/S 전화번호는 OCR에서 명확히 확인되지 않았습니다.")
+    if notice_type != "ETC":
+        needs_review.append("카테고리 API 연동 전까지 OCR 문구로 고시 상품군을 추정했습니다.")
+    if extracted.get("sizeDetail") and extracted.get("size"):
+        needs_review.append("상세 치수는 보조값으로만 보관하고 옵션 사이즈를 우선했습니다.")
+
+    matched_fields = {
+        key: extracted[key]
+        for key in ("material", "quantity", "color", "size", "sizeDetail", "importer", "manufacturer", "origin")
+        if extracted.get(key)
+    }
+    status = "matched" if matched_fields else "empty"
+    if needs_review:
+        status = "partial"
+
+    return {
+        "status": status,
+        "source": "ocr_label_match",
+        "productInfoProvidedNoticeType": notice_type,
+        "objectKey": object_key,
+        "productInfoProvidedNotice": {
+            "productInfoProvidedNoticeType": notice_type,
+            object_key: detail,
+        },
+        "extractedFields": extracted,
+        "matchedFields": matched_fields,
+        "needsReview": needs_review,
+    }
+
+
 def find_material_spec_terms(*values: object, include_free_numeric: bool = True) -> list[str]:
     text = " ".join(text_value(value) for value in values)
     patterns = [
@@ -1117,6 +1351,15 @@ def hydrate_seed_payload(seed_payload: dict) -> dict:
         if not isinstance(product, dict):
             continue
         base_gs = text_value(product.get("baseGs")) or split_gs(product.get("gs", ""))[0]
+        if not isinstance(product.get("naverProvidedNotice"), dict):
+            ocr = product.get("ocrAnalysis") if isinstance(product.get("ocrAnalysis"), dict) else {}
+            product["naverProvidedNotice"] = build_naver_provided_notice({
+                "gs": product.get("gs", ""),
+                "baseGs": base_gs,
+                "name": product.get("sourceName", ""),
+                "opt": product.get("optionSummary", ""),
+                "optionItems": product.get("optionItems", []),
+            }, ocr)
         processed = find_processed_listing_images(output_root, base_gs)
         processed_images = processed.get("urls") if isinstance(processed.get("urls"), list) else []
         if not processed_images:
@@ -1178,6 +1421,7 @@ def build_seed_products(
                 if url and url != source_thumb and url not in detail_image_set
             ][:20]
             selection_source = "source_listing_columns_only"
+        naver_provided_notice = build_naver_provided_notice(row, ocr_record)
         products.append({
             "gs": row.get("gs", ""),
             "baseGs": base_gs,
@@ -1205,6 +1449,7 @@ def build_seed_products(
                 "rawText": ocr_text,
                 "fields": ocr_record.get("fields", {}),
             },
+            "naverProvidedNotice": naver_provided_notice,
             "photoAnalysis": {
                 "status": "pending",
                 "facts": [],
@@ -2253,14 +2498,470 @@ def normalize_upload_entries(payload: dict) -> list[dict]:
             "mainImageSrc": text_value(row.get("mainImageSrc", "")),
             "additionalImageSrcs": [text_value(url) for url in additional_image_srcs if text_value(url)],
             "cafe24Url": text_value(row.get("cafe24Url", "")),
+            "price": text_value(row.get("price") or row.get("salePrice") or ""),
+            "optionSummary": text_value(row.get("optionSummary") or row.get("opt") or ""),
+            "naverProvidedNotice": row.get("naverProvidedNotice") if isinstance(row.get("naverProvidedNotice"), dict) else {},
         })
     return entries
+
+
+def parse_upload_price(value: object) -> int:
+    text = text_value(value)
+    if not text:
+        return 0
+    cleaned = re.sub(r"[^0-9.]", "", text)
+    if not cleaned:
+        return 0
+    try:
+        return int(float(cleaned))
+    except Exception:
+        return 0
+
+
+def option_summary_to_input(option_summary: object) -> str:
+    text = text_value(option_summary)
+    if not text or "단일" in text:
+        return ""
+    body = text
+    if "·" in body:
+        body = body.split("·", 1)[1]
+    body = re.sub(r"^\s*\d+\s*옵션\s*[:：-]?\s*", "", body).strip()
+    parts = [
+        re.sub(r"\s+", " ", part).strip(" ,/|")
+        for part in re.split(r"\s*/\s*|\s*\|\s*|,\s*", body)
+    ]
+    parts = [part for part in parts if part and part not in {"옵션", "선택형"}]
+    if not parts:
+        return ""
+    return "|".join(f"{chr(65 + index)} {part}" for index, part in enumerate(parts[:26]))
+
+
+def upload_image_src_to_path(src: object) -> Path | None:
+    raw = text_value(src)
+    if not raw:
+        return None
+    parsed = urllib.parse.urlparse(raw)
+    path_text = ""
+    if parsed.scheme in {"http", "https"}:
+        if parsed.path.startswith("/data/"):
+            path_text = urllib.parse.unquote(parsed.path.lstrip("/"))
+    elif raw.startswith("/data/"):
+        path_text = urllib.parse.unquote(raw.lstrip("/"))
+    elif raw.startswith("data/"):
+        path_text = urllib.parse.unquote(raw)
+    elif Path(raw).is_absolute():
+        path = Path(raw)
+        return path.resolve() if path.exists() else None
+
+    if not path_text:
+        return None
+    path = (ROOT / path_text).resolve()
+    return path if path.exists() and is_within(DATA_ROOT, path) else None
+
+
+def public_image_url(src: object) -> str:
+    raw = text_value(src)
+    if raw.startswith("http://") or raw.startswith("https://"):
+        parsed = urllib.parse.urlparse(raw)
+        file_name = Path(urllib.parse.unquote(parsed.path)).name
+        if file_name and not re.match(r"^[A-Za-z0-9._%+\-=()]+$", file_name):
+            return ""
+        return raw
+    return ""
+
+
+def base_gs_code(gs: object) -> str:
+    value = text_value(gs).upper()
+    return re.sub(r"[A-Z]$", "", value)
+
+
+def image_selection_for_entry(entry: dict) -> tuple[int | None, list[int]]:
+    main_path = upload_image_src_to_path(entry.get("mainImageSrc"))
+    add_paths = [upload_image_src_to_path(url) for url in entry.get("additionalImageSrcs", [])]
+    paths = [path for path in [main_path, *add_paths] if path is not None]
+    if not paths:
+        return None, []
+    folder = paths[0].parent
+    files = [
+        path.resolve()
+        for path in sorted(folder.iterdir(), key=image_file_sort_key)
+        if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+    ]
+    if not files:
+        return None, []
+    index_by_path = {str(path): index for index, path in enumerate(files)}
+    main_index = index_by_path.get(str(main_path.resolve())) if main_path else None
+    additional: list[int] = []
+    for path in add_paths:
+        if path is None:
+            continue
+        index = index_by_path.get(str(path.resolve()))
+        if index is not None and index != main_index and index not in additional:
+            additional.append(index)
+    return main_index, additional
+
+
+def update_export_image_selections(entries: list[dict]) -> None:
+    if not entries:
+        return
+    target = EXPORT_ROOT / "image_selections.json"
+    payload = read_json(target, {})
+    if not isinstance(payload, dict):
+        payload = {}
+    nested = payload.get("image_selections")
+    if not isinstance(nested, dict):
+        nested = {}
+    changed = False
+    for entry in entries:
+        gs_key = base_gs_code(entry.get("gs"))
+        if not gs_key:
+            continue
+        main_index, additional = image_selection_for_entry(entry)
+        if main_index is None:
+            continue
+        selection = {"main": main_index, "additional": additional}
+        payload[gs_key[:9]] = selection
+        nested[gs_key[:9]] = selection
+        changed = True
+    if changed:
+        payload["image_selections"] = nested
+        write_json(target, payload)
+
+
+def infer_direct_upload_categories(entry: dict) -> dict[str, str]:
+    text = " ".join(
+        text_value(entry.get(key))
+        for key in ("title", "sourceName", "searchTerms", "optionSummary", "gs")
+    )
+    compact = re.sub(r"\s+", "", text)
+    out: dict[str, str] = {}
+
+    def apply(**values: str) -> None:
+        for key, value in values.items():
+            if value and not out.get(key):
+                out[key] = value
+
+    if re.search(r"깔창|인솔|신발밑창|밑창보강", compact, re.IGNORECASE):
+        apply(
+            naver="50000667",
+            coupang="64623",
+            lotte_standard="BC43071000",
+            lotte_display="FC18101001",
+            lotte_item="38",
+        )
+    if re.search(r"카라비너|릴고리|릴홀더|키홀더|키링|연결고리|등산고리|고리", compact, re.IGNORECASE):
+        apply(
+            naver="50002646",
+            coupang="81718",
+            lotte_standard="BC20040800",
+            lotte_display="EC10400324",
+            lotte_item="38",
+        )
+    if re.search(r"에어컨.*커버|실외기.*커버|커버.*실외기", compact, re.IGNORECASE):
+        apply(
+            naver="50003518",
+            coupang="78137",
+            lotte_standard="BC63120300",
+            lotte_display="FC11160703",
+            lotte_item="38",
+        )
+    if re.search(r"가구발커버|의자발커버|가구커버|소파커버|커버류", compact, re.IGNORECASE):
+        apply(
+            naver="50003521",
+            coupang="78133",
+            lotte_standard="BC63120300",
+            lotte_display="FC11160703",
+            lotte_item="38",
+        )
+    if re.search(r"작업장갑|안전장갑|코팅장갑|나일론.*장갑|오픈핑거.*장갑|장갑", compact, re.IGNORECASE):
+        apply(
+            naver="50003450",
+            coupang="64387",
+            lotte_standard="BC10040800",
+            lotte_display="FC19041003",
+            lotte_item="04",
+        )
+    if re.search(r"나사|스크류|볼트|너트|브라켓|고정핀|철물|부속|부품", compact, re.IGNORECASE):
+        apply(
+            naver="50003466",
+            coupang="64310",
+            lotte_standard="BC10080200",
+            lotte_display="FC19040401",
+            lotte_item="38",
+        )
+    return out
+
+
+def write_direct_upload_workbook(job_id: str, entry: dict) -> Path:
+    try:
+        from openpyxl import Workbook
+    except Exception as exc:
+        raise RuntimeError(f"openpyxl 로드 실패: {exc}") from exc
+
+    file_name = safe_name(f"api_upload_{job_id}_{entry['channel']}_{entry['gs']}.xlsx")
+    target = EXPORT_ROOT / file_name
+    title = clean_product_title(entry.get("title")) or clean_product_title(entry.get("sourceName")) or entry["gs"]
+    search_terms = text_value(entry.get("searchTerms"))
+    price = parse_upload_price(entry.get("price")) or 1000
+    option_input = option_summary_to_input(entry.get("optionSummary"))
+    public_images = [
+        url for url in [
+            public_image_url(entry.get("mainImageSrc")),
+            *[public_image_url(url) for url in entry.get("additionalImageSrcs", [])],
+        ]
+        if url
+    ]
+    image_list = "|".join(public_images[:9])
+    detail_html = "상세페이지 참조"
+    if public_images:
+        detail_html = "<center>" + "".join(f'<img src="{url}">' for url in public_images[:12]) + "</center>"
+    categories = infer_direct_upload_categories(entry)
+
+    headers = [
+        "상품코드", "자체 상품코드", "판매자내부상품번호", "상품명", "공급사 상품명",
+        "홈런_공통마켓상품명", "홈런_네이버상품명", "네이버상품명", "홈런_네이버태그", "네이버태그",
+        "홈런_쿠팡상품명", "쿠팡상품명", "홈런_쿠팡검색태그", "쿠팡검색태그",
+        "홈런_롯데ON상품명", "롯데ON상품명", "홈런_롯데ON검색키워드", "롯데ON검색키워드",
+        "네이버카테고리코드", "쿠팡카테고리코드", "롯데ON표준카테고리코드", "롯데ON전시카테고리코드", "롯데ON상품품목코드",
+        "홈런_공통마켓검색키워드", "공통마켓검색키워드", "검색어설정", "검색키워드",
+        "판매가", "상품가", "소비자가", "옵션입력", "옵션추가금",
+        "이미지등록(목록)", "이미지등록(추가)", "이미지등록(상세)",
+        "상품 상세설명", "상세설명", "브랜드",
+    ]
+    row = {
+        "상품코드": entry["gs"],
+        "자체 상품코드": entry["gs"],
+        "판매자내부상품번호": entry["gs"],
+        "상품명": title,
+        "공급사 상품명": title,
+        "홈런_공통마켓상품명": title,
+        "홈런_네이버상품명": title if entry["market"] == "네이버" else "",
+        "네이버상품명": title if entry["market"] == "네이버" else "",
+        "홈런_네이버태그": search_terms if entry["market"] == "네이버" else "",
+        "네이버태그": search_terms if entry["market"] == "네이버" else "",
+        "홈런_쿠팡상품명": title if entry["market"] == "쿠팡" else "",
+        "쿠팡상품명": title if entry["market"] == "쿠팡" else "",
+        "홈런_쿠팡검색태그": search_terms if entry["market"] == "쿠팡" else "",
+        "쿠팡검색태그": search_terms if entry["market"] == "쿠팡" else "",
+        "홈런_롯데ON상품명": title if entry["market"] == "롯데ON" else "",
+        "롯데ON상품명": title if entry["market"] == "롯데ON" else "",
+        "홈런_롯데ON검색키워드": search_terms if entry["market"] == "롯데ON" else "",
+        "롯데ON검색키워드": search_terms if entry["market"] == "롯데ON" else "",
+        "네이버카테고리코드": categories.get("naver", ""),
+        "쿠팡카테고리코드": categories.get("coupang", ""),
+        "롯데ON표준카테고리코드": categories.get("lotte_standard", ""),
+        "롯데ON전시카테고리코드": categories.get("lotte_display", ""),
+        "롯데ON상품품목코드": categories.get("lotte_item", ""),
+        "홈런_공통마켓검색키워드": search_terms,
+        "공통마켓검색키워드": search_terms,
+        "검색어설정": search_terms,
+        "검색키워드": search_terms,
+        "판매가": price,
+        "상품가": price,
+        "소비자가": price,
+        "옵션입력": option_input,
+        "옵션추가금": "",
+        "이미지등록(목록)": image_list,
+        "이미지등록(추가)": "|".join(public_images[1:9]),
+        "이미지등록(상세)": "",
+        "상품 상세설명": detail_html,
+        "상세설명": detail_html,
+        "브랜드": "샤플라이",
+    }
+
+    workbook = Workbook()
+    first = True
+    for sheet_name in ("분리추출후", "A마켓", "B마켓"):
+        sheet = workbook.active if first else workbook.create_sheet(sheet_name)
+        first = False
+        sheet.title = sheet_name
+        sheet.append(headers)
+        sheet.append([row.get(header, "") for header in headers])
+    workbook.save(target)
+    return target
+
+
+def market_cli_flag(market: str) -> str:
+    return {
+        "네이버": "--naver",
+        "쿠팡": "--coupang",
+        "롯데ON": "--lotteon",
+    }.get(market, "")
+
+
+def resolve_market_key_path(settings: dict, account: str, market: str) -> Path:
+    item = settings.get(market_key_id(account, market))
+    if not isinstance(item, dict):
+        raise FileNotFoundError(f"{account}:{market} 키 파일이 없습니다.")
+    path = Path(item.get("path", "")).resolve()
+    if not path.is_file() or not is_within(MARKET_KEY_ROOT, path):
+        raise FileNotFoundError(f"{account}:{market} 키 파일을 찾지 못했습니다.")
+    return path
+
+
+def backup_or_remove_key_file(target: Path, temp_dir: Path) -> tuple[str, Path | None]:
+    if target.exists():
+        backup = temp_dir / target.name
+        shutil.copy2(target, backup)
+        return "backup", backup
+    return "missing", None
+
+
+@contextmanager
+def market_key_overlay(account: str, market: str, settings: dict):
+    DESKTOP_KEY_ROOT.mkdir(parents=True, exist_ok=True)
+    temp_dir = Path(tempfile.mkdtemp(prefix="webocr_key_overlay_", dir=str(EXPORT_ROOT)))
+    restored: list[tuple[Path, str, Path | None]] = []
+
+    def overlay_file(source: Path, target_name: str, hide_only: bool = False) -> None:
+        target = (DESKTOP_KEY_ROOT / target_name).resolve()
+        if source.resolve() == target:
+            return
+        state, backup = backup_or_remove_key_file(target, temp_dir)
+        restored.append((target, state, backup))
+        if hide_only:
+            if target.exists():
+                target.unlink()
+            return
+        shutil.copy2(source, target)
+
+    with MARKET_KEY_OVERLAY_LOCK:
+        try:
+            source = resolve_market_key_path(settings, account, market)
+            if market == "네이버":
+                overlay_file(source, "naver_client_key.txt")
+            elif market == "쿠팡":
+                overlay_file(source, "coupang_wing_api.txt")
+            elif market == "롯데ON":
+                if source.suffix.lower() == ".json":
+                    overlay_file(source, "lotteon_upload_id.json")
+                else:
+                    overlay_file(source, "lotteon_api.txt")
+                    overlay_file(source, "lotteon_upload_id.json", hide_only=True)
+            else:
+                raise ValueError(f"{market}은 API 업로드 대상이 아닙니다.")
+
+            cafe24_item = settings.get(market_key_id(account, "Cafe24"))
+            if isinstance(cafe24_item, dict):
+                cafe24_path = Path(cafe24_item.get("path", "")).resolve()
+                if cafe24_path.is_file() and is_within(MARKET_KEY_ROOT, cafe24_path):
+                    overlay_file(cafe24_path, "cafe24_token_rkghrud1.json")
+            yield
+        finally:
+            for target, state, backup in reversed(restored):
+                try:
+                    if state == "backup" and backup and backup.exists():
+                        shutil.copy2(backup, target)
+                    elif state == "missing" and target.exists():
+                        target.unlink()
+                except Exception:
+                    pass
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+
+def parse_direct_upload_result(entry: dict, exit_code: int, lines: list[str]) -> dict:
+    result = {**entry, "status": "failed", "updatedAt": now_text(), "error": "", "productId": ""}
+    tail_text = "\n".join(lines[-80:])
+    if exit_code != 0:
+        result["error"] = scrub_secret(tail_text or f"dotnet exit code {exit_code}", 400)
+        return result
+
+    market = entry["market"]
+    if market == "네이버":
+        pattern = r"\[네이버\]\s+row=\d+\s+status=(\S+)\s+id=(.*?)\s+error=(.*)"
+        id_name = "productId"
+    elif market == "쿠팡":
+        pattern = r"\[쿠팡\]\s+row=\d+\s+status=(\S+)\s+id=(.*?)\s+category=.*?\s+error=(.*)"
+        id_name = "sellerProductId"
+    else:
+        pattern = r"\[롯데ON\]\s+row=\d+\s+status=(\S+)\s+spdNo=(.*?)\s+error=(.*)"
+        id_name = "spdNo"
+
+    matches = re.findall(pattern, tail_text)
+    if not matches:
+        result["error"] = scrub_secret(tail_text or "업로드 결과를 파싱하지 못했습니다.", 400)
+        return result
+
+    status, product_id, error = matches[-1]
+    status_upper = status.upper()
+    result[id_name] = product_id.strip()
+    result["productId"] = product_id.strip()
+    result["rawStatus"] = status_upper
+    if status_upper in {"OK", "DRY_RUN_OK", "DRY_RUN"}:
+        result["status"] = "uploaded"
+    elif status_upper in {"SKIP_DUP"}:
+        result["status"] = "skipped"
+        result["error"] = error.strip() or "기존 성공 이력 있음"
+    else:
+        result["status"] = "failed"
+        result["error"] = error.strip() or status_upper
+    return result
+
+
+def execute_direct_market_upload(job_id: str, entry: dict, workbook_path: Path, log, results: list[dict]) -> tuple[dict, list[str]]:
+    flag = market_cli_flag(entry["market"])
+    if not flag:
+        raise ValueError(f"{entry['market']}은 API 업로드 대상이 아닙니다.")
+    cmd = [
+        "dotnet", "run",
+        "--project", str(DOTNET_UPLOAD_PROJECT),
+        "--",
+        "--direct-market-upload",
+        "--file", str(workbook_path),
+        "--gs", entry["gs"],
+        flag,
+    ]
+    if entry["market"] == "롯데ON":
+        cmd.append("--force")
+    if entry.get("dryRun"):
+        cmd.append("--dry-run")
+
+    log.write(" ".join(f'"{part}"' if " " in part else part for part in cmd) + "\n")
+    process = subprocess.Popen(
+        cmd,
+        cwd=str(PROJECT_ROOT),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+    )
+    register_active_process(job_id, process)
+    lines: list[str] = []
+    try:
+        assert process.stdout is not None
+        for line in process.stdout:
+            if job_id in CANCELLED_JOB_IDS:
+                stop_process_tree(process)
+                break
+            clean = line.rstrip("\n")
+            lines.append(clean)
+            log.write(clean + "\n")
+            log.flush()
+            current = read_json(JOBS_ROOT / f"{job_id}.json", {"jobId": job_id})
+            current.update({
+                "status": "running",
+                "updatedAt": now_text(),
+                "currentStage": f"{entry['channel']} API 실행",
+                "tail": lines[-20:],
+                "results": results,
+            })
+            write_json(JOBS_ROOT / f"{job_id}.json", current)
+        exit_code = process.wait()
+    finally:
+        unregister_active_process(job_id, process)
+    return parse_direct_upload_result(entry, exit_code, lines), lines
 
 
 def run_market_upload_job(job_id: str, payload: dict) -> None:
     job_path = JOBS_ROOT / f"{job_id}.json"
     log_path = JOBS_ROOT / f"{job_id}.log"
     entries = normalize_upload_entries(payload)
+    dry_run = bool(payload.get("dryRun"))
+    if dry_run:
+        for entry in entries:
+            entry["dryRun"] = True
     job = read_json(job_path, {"jobId": job_id})
     job.update({
         "status": "running",
@@ -2276,12 +2977,15 @@ def run_market_upload_job(job_id: str, payload: dict) -> None:
     results: list[dict] = []
     api_markets = {"네이버", "쿠팡", "롯데ON"}
     try:
+        update_export_image_selections(entries)
         with log_path.open("w", encoding="utf-8", errors="replace") as log:
             log.write(f"[{now_text()}] START marketUpload\n")
             log.write(f"entries: {len(entries)}\n")
             if not entries:
                 raise ValueError("upload entries empty")
             for index, entry in enumerate(entries, start=1):
+                if job_id in CANCELLED_JOB_IDS:
+                    raise RuntimeError("업로드 작업이 중지되었습니다.")
                 market = entry["market"]
                 key_id = market_key_id(entry["account"], market)
                 result = {**entry, "status": "failed", "updatedAt": now_text()}
@@ -2291,8 +2995,15 @@ def run_market_upload_job(job_id: str, payload: dict) -> None:
                 elif key_id not in settings:
                     result["error"] = f"{entry['channel']} 키 파일이 없습니다."
                 else:
-                    result["error"] = "WEBOCRV2 실제 업로드 어댑터가 아직 연결되지 않았습니다. V4 업로드 서비스 연결 후 실행해야 합니다."
                     result["keyFile"] = settings[key_id].get("fileName", "")
+                    workbook_path = write_direct_upload_workbook(job_id, entry)
+                    result["workbookPath"] = str(workbook_path)
+                    log.write(f"[{index}/{len(entries)}] {entry['channel']} {entry['gs']} 실제 API 업로드 시작\n")
+                    log.flush()
+                    with market_key_overlay(entry["account"], market, settings):
+                        result, _lines = execute_direct_market_upload(job_id, entry, workbook_path, log, results)
+                    result["keyFile"] = settings[key_id].get("fileName", "")
+                    result["workbookPath"] = str(workbook_path)
                 results.append(result)
                 log.write(f"[{index}/{len(entries)}] {entry['channel']} {entry['gs']} -> {result['status']} {result.get('error', '')}\n")
                 log.flush()
@@ -2301,7 +3012,7 @@ def run_market_upload_job(job_id: str, payload: dict) -> None:
                     "status": "running",
                     "updatedAt": now_text(),
                     "progressPercent": min(95, 10 + int(index / max(len(entries), 1) * 80)),
-                    "currentStage": f"업로드 검증 {index}/{len(entries)}",
+                    "currentStage": f"API 업로드 {index}/{len(entries)}",
                     "results": results,
                     "tail": [f"{item['channel']} {item['gs']} {item['status']}" for item in results[-20:]],
                 })
@@ -2310,7 +3021,7 @@ def run_market_upload_job(job_id: str, payload: dict) -> None:
             "status": "completed",
             "finishedAt": now_text(),
             "progressPercent": 100,
-            "currentStage": "업로드 검증 완료",
+            "currentStage": "API 업로드 완료",
             "result": {
                 "total": len(results),
                 "success": sum(1 for item in results if item.get("status") == "uploaded"),

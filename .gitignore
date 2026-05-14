@@ -11,3 +11,4 @@ data/market_keys/
 
 __pycache__/
 *.pyc
+.gstack/
