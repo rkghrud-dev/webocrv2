@@ -86,6 +86,43 @@ KEYWORD_POOL_CATEGORIES = [
 ]
 
 SALES_MARKETS = ["네이버", "쿠팡", "롯데ON", "11번가", "ESM"]
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+COMPOUND_SPACING_RULES = [
+    ("카라비너릴고리", "카라비너 릴고리"),
+    ("와이어릴고리", "와이어 릴고리"),
+    ("릴고리카라비너", "릴고리 카라비너"),
+    ("카라비너릴홀더", "카라비너 릴홀더"),
+    ("릴홀더와이어", "릴홀더 와이어"),
+    ("와이어릴홀더", "와이어 릴홀더"),
+    ("카라비너클립", "카라비너 클립"),
+    ("백팩카라비너", "백팩 카라비너"),
+    ("ABS카라비너", "ABS 카라비너"),
+    ("카라비너고리", "카라비너 고리"),
+    ("카라비너열쇠고리", "카라비너 열쇠고리"),
+    ("카라비너가방고리", "카라비너 가방고리"),
+    ("카라비너와이어", "카라비너 와이어"),
+    ("키고리릴", "키고리 릴"),
+    ("쿠션깔창", "쿠션 깔창"),
+    ("신발깔창", "신발 깔창"),
+    ("소프트깔창", "소프트 깔창"),
+    ("쿠션인솔", "쿠션 인솔"),
+    ("보강패드", "보강 패드"),
+    ("충격완화", "충격 완화"),
+    ("미끄럼방지", "미끄럼 방지"),
+    ("먼지방지", "먼지 방지"),
+    ("방수방진", "방수 방진"),
+    ("열기차단", "열기 차단"),
+    ("햇빛차단", "햇빛 차단"),
+    ("사계절보호", "사계절 보호"),
+]
+
+BANNED_MARKETING_TERMS = [
+    "발편한", "발 편한", "편한발", "편한 발",
+    "무료배송", "할인", "세일", "특가", "추천", "인기", "베스트", "핫템",
+    "가성비", "저렴한", "예쁜", "프리미엄", "고급", "고급형", "최고급",
+    "판매", "가격", "문의", "상담",
+]
 
 LISTING_IMAGE_COLUMNS = [
     "이미지등록(목록)",
@@ -194,6 +231,22 @@ def is_within(parent: Path, child: Path) -> bool:
         return False
 
 
+def runtime_web_url(path: Path) -> str:
+    resolved = path.resolve()
+    if not is_within(ROOT, resolved):
+        return str(resolved)
+    relative = resolved.relative_to(ROOT).as_posix()
+    return "/" + urllib.parse.quote(relative, safe="/:._-")
+
+
+def image_file_sort_key(path: Path) -> tuple[int, str]:
+    match = re.search(r"_(\d+)(?:\.[^.]+)$", path.name)
+    if match:
+        return int(match.group(1)), path.name.lower()
+    numbers = re.findall(r"\d+", path.stem)
+    return int(numbers[-1]) if numbers else 9999, path.name.lower()
+
+
 def resolve_seed_path(value: str) -> Path:
     raw = text_value(value)
     if not raw:
@@ -210,7 +263,7 @@ def resolve_seed_path(value: str) -> Path:
 
 
 def seed_summary(path: Path) -> dict:
-    payload = read_json(path, {})
+    payload = hydrate_seed_payload(read_json(path, {}))
     products = payload.get("products") if isinstance(payload.get("products"), list) else []
     first = products[0] if products else {}
     images = first.get("images", {}) if isinstance(first, dict) else {}
@@ -713,6 +766,33 @@ def normalize_term(term: object) -> str:
     return text
 
 
+def apply_compound_spacing(value: object) -> str:
+    text = text_value(value)
+    for source, target in COMPOUND_SPACING_RULES:
+        text = text.replace(source, target)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def remove_marketing_terms(value: object) -> str:
+    text = apply_compound_spacing(value)
+    for word in BANNED_MARKETING_TERMS:
+        text = re.sub(re.escape(word), " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip(" ,/|")
+
+
+def clean_product_title(value: object) -> str:
+    text = remove_marketing_terms(value)
+    text = re.sub(r"\b1\s*(?:개|입|매|p|P|pcs|PCS|pc|PC)\b", " ", text)
+    text = re.sub(r"\s{2,}", " ", text)
+    return text.strip(" ,/|")
+
+
+def compact_search_keyword(value: object) -> str:
+    text = remove_marketing_terms(value)
+    text = re.sub(r"\s+", "", text)
+    return text.strip(" ,/|")
+
+
 def split_candidate_terms(*values: object) -> list[str]:
     terms: list[str] = []
     for value in values:
@@ -963,7 +1043,107 @@ def read_pipeline_keyword_summary(output_file: str) -> dict:
     return summary
 
 
-def build_seed_products(source_path: str, selected_gs: list[str], ocr_summary: dict, keyword_summary: dict | None = None) -> list[dict]:
+def find_processed_listing_images(output_root: object, base_gs: str, min_count: int = 3) -> dict:
+    base = text_value(base_gs).upper()
+    if not base:
+        return {"urls": [], "folder": "", "status": "missing"}
+    search_roots: list[Path] = []
+    root_value = text_value(output_root)
+    if root_value:
+        search_roots.append(Path(root_value))
+    search_roots.append(EXPORT_ROOT)
+
+    listing_roots: list[Path] = []
+    for root in search_roots:
+        root = root.resolve()
+        candidates = [root / "listing_images"]
+        if root.name.lower() == "listing_images":
+            candidates.insert(0, root)
+        for candidate in candidates:
+            if candidate.is_dir() and candidate not in listing_roots:
+                listing_roots.append(candidate)
+
+    folders: list[Path] = []
+    for listing_root in listing_roots:
+        direct_candidates = [
+            listing_root / base,
+            *(path for path in listing_root.glob(f"*/{base}") if path.is_dir()),
+        ]
+        for folder in direct_candidates:
+            if folder.is_dir() and folder not in folders:
+                folders.append(folder)
+
+    folders.sort(key=lambda folder: folder.stat().st_mtime, reverse=True)
+    best_files: list[Path] = []
+    best_folder = ""
+    for folder in folders:
+        files = sorted(
+            [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS],
+            key=image_file_sort_key,
+        )
+        if len(files) > len(best_files):
+            best_files = files
+            best_folder = str(folder)
+        if len(files) >= min_count:
+            return {
+                "urls": [runtime_web_url(path) for path in files],
+                "folder": str(folder),
+                "status": "ready",
+            }
+
+    return {
+        "urls": [],
+        "folder": best_folder,
+        "status": "insufficient" if best_files else "missing",
+        "foundCount": len(best_files),
+        "requiredCount": min_count,
+    }
+
+
+def hydrate_seed_payload(seed_payload: dict) -> dict:
+    if not isinstance(seed_payload, dict):
+        return seed_payload
+    output_root = (
+        seed_payload.get("pipelineResult", {}).get("output_root", "")
+        if isinstance(seed_payload.get("pipelineResult"), dict)
+        else ""
+    ) or (
+        seed_payload.get("artifacts", {}).get("outputRoot", "")
+        if isinstance(seed_payload.get("artifacts"), dict)
+        else ""
+    )
+    products = seed_payload.get("products") if isinstance(seed_payload.get("products"), list) else []
+    for product in products:
+        if not isinstance(product, dict):
+            continue
+        base_gs = text_value(product.get("baseGs")) or split_gs(product.get("gs", ""))[0]
+        processed = find_processed_listing_images(output_root, base_gs)
+        processed_images = processed.get("urls") if isinstance(processed.get("urls"), list) else []
+        if not processed_images:
+            continue
+        images = product.get("images") if isinstance(product.get("images"), dict) else {}
+        images.update({
+            "sourceThumb": processed_images[0],
+            "representative": processed_images[0],
+            "listingCandidates": processed_images,
+            "additional": processed_images[1:20],
+            "selectionSource": "processed_listing_images",
+            "processedFolder": processed.get("folder", ""),
+            "processedStatus": processed.get("status", ""),
+            "processedFoundCount": len(processed_images),
+            "processedRequiredCount": 3,
+        })
+        product["images"] = images
+    return seed_payload
+
+
+def build_seed_products(
+    source_path: str,
+    selected_gs: list[str],
+    ocr_summary: dict,
+    keyword_summary: dict | None = None,
+    output_root: object = "",
+) -> list[dict]:
     parsed = parse_source_preview(Path(source_path), max_preview=100000)
     selected = set(selected_gs or [])
     ocr_by_gs = (ocr_summary or {}).get("ocrByGs", {})
@@ -979,14 +1159,25 @@ def build_seed_products(source_path: str, selected_gs: list[str], ocr_summary: d
         option_summary = row.get("opt", "단일")
         option_items = row.get("optionItems", [])
         option_info = option_meta(option_summary, option_items)
-        listing_images = unique_terms(row.get("listingImages") or [])
-        source_thumb = row.get("thumb", "") or (listing_images[0] if listing_images else "")
+        processed = find_processed_listing_images(output_root, base_gs)
+        processed_images = processed.get("urls") if isinstance(processed.get("urls"), list) else []
+        raw_listing_images = unique_terms(row.get("listingImages") or [])
+        raw_source_thumb = row.get("thumb", "") or (raw_listing_images[0] if raw_listing_images else "")
         detail_image_set = set(row.get("detailImages") or [])
-        additional_images = [
-            url
-            for url in unique_terms((row.get("additionalImages") or []) + [url for url in listing_images if url != source_thumb])
-            if url and url != source_thumb and url not in detail_image_set
-        ][:20]
+        if processed_images:
+            listing_images = processed_images
+            source_thumb = processed_images[0]
+            additional_images = processed_images[1:20]
+            selection_source = "processed_listing_images"
+        else:
+            listing_images = raw_listing_images
+            source_thumb = raw_source_thumb
+            additional_images = [
+                url
+                for url in unique_terms((row.get("additionalImages") or []) + [url for url in listing_images if url != source_thumb])
+                if url and url != source_thumb and url not in detail_image_set
+            ][:20]
+            selection_source = "source_listing_columns_only"
         products.append({
             "gs": row.get("gs", ""),
             "baseGs": base_gs,
@@ -1003,7 +1194,11 @@ def build_seed_products(source_path: str, selected_gs: list[str], ocr_summary: d
                 "additional": additional_images,
                 "detail": row.get("detailImages", []),
                 "processedSize": "1000x1000",
-                "selectionSource": "listing_image_columns_only",
+                "selectionSource": selection_source,
+                "processedFolder": processed.get("folder", ""),
+                "processedStatus": processed.get("status", ""),
+                "processedFoundCount": processed.get("foundCount", len(processed_images)),
+                "processedRequiredCount": processed.get("requiredCount", 3),
             },
             "ocrAnalysis": {
                 "status": "loaded" if ocr_record else "pending",
@@ -1123,7 +1318,7 @@ def build_keyword_prompt(input_file: str, output_file: str) -> str:
   3) 주 사용처 또는 구매 상황
   4) 재질/규격은 상품 식별에 중요할 때만 추가
 - 상품명이 짧아질 때는 수량을 넣지 말고 기능/사용처/문제해결 단어로 채운다.
-- 좋은 상품명 예시 구조: `카라비너 릴고리 와이어 릴홀더 백팩 스트랩 연결고리`, `쿠션깔창 신발 밑창 보강 패드 운동화 구두 PU`.
+- 좋은 상품명 예시 구조: `카라비너 릴고리 와이어 릴홀더 백팩 스트랩 연결고리`, `쿠션 깔창 신발 밑창 보강 패드 운동화 구두 PU`.
 - 네이버 상품명은 35-48자 사이를 우선한다. 50자를 넘기지 않는다.
 - 네이버는 SEO 기준을 우선한다. 상품명 공식은 `브랜드/제조사 + 모델명/모델코드 + 상품유형/카테고리 + 색상/용도/주요속성`이지만, 브랜드/모델이 없으면 빼고 핵심 카테고리와 용도/속성을 앞에 둔다.
 - 네이버에서 참고할 항목은 브랜드/제조사, 시리즈, 모델명/모델코드, 상품 유형/카테고리, 색상, 소재, 구성품/수량, 사이즈, 대상 성별/연령, 용량/규격/주요 속성, 판매 옵션이다.
@@ -1141,10 +1336,12 @@ def build_keyword_prompt(input_file: str, output_file: str) -> str:
 - `2개`, `5매`, `10개`, `100p`, `3세트`처럼 실제 구성 차이를 만드는 수량만 검색어에 남길 수 있다.
 - OCR에서만 나온 숫자, 눈금, 이미지 배경 숫자는 상품명/검색어에서 제외한다.
 - 무료배송/할인/추천/인기/베스트/가격/문의/상담/판매자명 같은 판매 문구는 금지한다.
+- `발편한`, `발 편한`, `편한발`처럼 감성/광고형 문구는 상품명과 검색어에 넣지 않는다. `쿠션`, `충격 완화`, `착용감 보강`처럼 기능어로 바꾼다.
 - 같은 단어를 반복하지 않는다.
-- 붙여쓴 합성어는 자연스럽게 띄어쓴다. 예: 카라비너릴고리 -> 카라비너 릴고리, 와이어릴고리 -> 와이어 릴고리.
+- 상품명에서는 붙여쓴 합성어를 자연스럽게 띄어쓴다. 예: 카라비너릴고리 -> 카라비너 릴고리, 와이어릴고리 -> 와이어 릴고리, 쿠션깔창 -> 쿠션 깔창, 보강패드 -> 보강 패드, 충격완화 -> 충격 완화.
 - 검색어/태그는 12-20개를 목표로 하며, 상품명에 못 넣은 동의어/현장명/사용처/문제해결어를 우선 보강한다.
 - 검색어에는 쉼표로 구분된 실제 검색 가능한 말만 넣고, 무관한 인기어와 일부러 만든 오타는 넣지 않는다.
+- 검색어/태그의 각 항목은 공백 없이 붙여쓴다. 예: `쿠션 깔창`은 검색어에서 `쿠션깔창`, `보강 패드`는 `보강패드`, `충격 완화`는 `충격완화`로 쓴다.
 - `title`, `searchTerms`, `tags`는 비워두지 않는다.
 - 요청 채널이 10개면 상품마다 10개 채널 모두 작성한다.
 
@@ -1166,8 +1363,24 @@ def strip_low_value_single_quantity(value: str) -> str:
     return cleaned.strip(" ,/")
 
 
+def split_search_keyword_chunks(value: object) -> list[str]:
+    raw = text_value(value)
+    if not raw:
+        return []
+    raw = re.sub(r"<[^>]+>", " ", raw)
+    chunks: list[str] = []
+    for chunk in re.split(r"[,/|;·\n\r\t]+", raw):
+        text = normalize_term(chunk)
+        if text:
+            chunks.append(text)
+    return unique_terms(chunks)
+
+
 def clean_keyword_terms(value: str) -> str:
-    terms = [strip_low_value_single_quantity(term) for term in split_candidate_terms(value)]
+    terms = [
+        compact_search_keyword(strip_low_value_single_quantity(term))
+        for term in split_search_keyword_chunks(value)
+    ]
     return ", ".join(unique_terms([term for term in terms if term]))
 
 
@@ -1192,10 +1405,14 @@ def validate_keyword_result(payload: dict, products: list[dict], channels: list[
             value = raw_channels.get(channel)
             if not isinstance(value, dict):
                 continue
-            title = strip_low_value_single_quantity(value.get("title"))
+            title = clean_product_title(strip_low_value_single_quantity(value.get("title")))
             search_terms = clean_keyword_terms(value.get("searchTerms") or value.get("search_terms"))
             tags = value.get("tags") if isinstance(value.get("tags"), list) else split_candidate_terms(search_terms)
-            tags = unique_terms([strip_low_value_single_quantity(tag) for tag in tags if strip_low_value_single_quantity(tag)])[:30]
+            tags = unique_terms([
+                compact_search_keyword(strip_low_value_single_quantity(tag))
+                for tag in tags
+                if compact_search_keyword(strip_low_value_single_quantity(tag))
+            ])[:30]
             if not title or not search_terms:
                 continue
             candidate_count = len(tags) or len(split_candidate_terms(search_terms))
@@ -1746,7 +1963,13 @@ def run_seed_job(job_id: str, payload: dict) -> None:
             (result_payload or {}).get("output_root", ""),
         )
         keyword_summary = read_pipeline_keyword_summary((result_payload or {}).get("output_file", ""))
-        products = build_seed_products(effective_source_path, selected_gs, ocr_summary, keyword_summary)
+        products = build_seed_products(
+            effective_source_path,
+            selected_gs,
+            ocr_summary,
+            keyword_summary,
+            (result_payload or {}).get("output_root", ""),
+        )
         job.update({"progressPercent": 92, "currentStage": "시드 파일 작성", "updatedAt": now_text()})
         write_json(job_path, job)
         seed_payload = {
@@ -2014,6 +2237,9 @@ def normalize_upload_entries(payload: dict) -> list[dict]:
         if not account or not market or not gs:
             continue
         channel = text_value(row.get("channel") or row.get("channelKey") or f"{account}:{market}")
+        additional_image_srcs = row.get("additionalImageSrcs")
+        if not isinstance(additional_image_srcs, list):
+            additional_image_srcs = extract_image_urls(row.get("additionalImageSrcs", ""))
         entries.append({
             "queueKey": text_value(row.get("queueKey") or f"{channel}:{gs}"),
             "account": account,
@@ -2025,6 +2251,7 @@ def normalize_upload_entries(payload: dict) -> list[dict]:
             "searchTerms": text_value(row.get("searchTerms", "")),
             "mainImage": text_value(row.get("mainImage", "")),
             "mainImageSrc": text_value(row.get("mainImageSrc", "")),
+            "additionalImageSrcs": [text_value(url) for url in additional_image_srcs if text_value(url)],
             "cafe24Url": text_value(row.get("cafe24Url", "")),
         })
     return entries
@@ -2108,7 +2335,7 @@ def write_market_export(payload: dict) -> dict:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     headers = [
         "계정", "마켓", "GS코드", "원본상품명", "업로드상품명", "검색어설정",
-        "대표이미지", "대표이미지URL", "Cafe24 URL", "상태",
+        "대표이미지", "대표이미지URL", "추가이미지URL", "Cafe24 URL", "상태",
     ]
     try:
         from openpyxl import Workbook
@@ -2129,6 +2356,7 @@ def write_market_export(payload: dict) -> dict:
                 entry["searchTerms"],
                 entry["mainImage"],
                 entry["mainImageSrc"],
+                "\n".join(entry.get("additionalImageSrcs", [])),
                 entry["cafe24Url"],
                 "대기",
             ])
@@ -2150,6 +2378,7 @@ def write_market_export(payload: dict) -> dict:
                     entry["searchTerms"],
                     entry["mainImage"],
                     entry["mainImageSrc"],
+                    "\n".join(entry.get("additionalImageSrcs", [])),
                     entry["cafe24Url"],
                     "대기",
                 ])
@@ -2269,7 +2498,7 @@ class WebOcrHandler(SimpleHTTPRequestHandler):
             if not seed_path.exists():
                 self.send_json({"ok": False, "error": "seed not found"}, 404)
                 return
-            self.send_json({"ok": True, "seed": read_json(seed_path, {}), "summary": seed_summary(seed_path)})
+            self.send_json({"ok": True, "seed": hydrate_seed_payload(read_json(seed_path, {})), "summary": seed_summary(seed_path)})
             return
         if path.startswith("/api/jobs/"):
             job_id = safe_name(path.rsplit("/", 1)[-1], "")

@@ -142,6 +142,7 @@ const KEYWORD_BAN_WORDS = [
   '무료배송', '배송', '쿠폰', '할인', '특가', '행사', '사은품', '추천', '가격', '판매',
   '저렴한', '예쁜', '인기', '핫템', '베스트', '정품', '고급진', '럭셔리', '필수품',
   '데일리', '프리미엄', '최고급', '모음', '추천템', '가성비', '초특가',
+  '발편한', '발 편한', '편한발', '편한 발',
   '홈런마켓', '굿셀러스', '수입사', '제조국', '중국', '급배송', '당일', '발송',
   '택배', '묶음배송', '대량구매', '문의', '상담', '문자상담', '환영합니다',
   '참고사항', '참고용', '측정방법', '오차', '발생할', '선택하세요', '크기에',
@@ -167,20 +168,27 @@ const COMPOUND_SPACING_RULES = [
   ['신발깔창', '신발 깔창'],
   ['소프트깔창', '소프트 깔창'],
   ['쿠션인솔', '쿠션 인솔'],
+  ['보강패드', '보강 패드'],
+  ['충격완화', '충격 완화'],
+  ['미끄럼방지', '미끄럼 방지'],
   ['가구천커버', '가구 천 커버'],
   ['가구커버', '가구 커버'],
   ['가구덮개', '가구 덮개'],
   ['소파커버', '소파 커버'],
   ['탁자커버', '탁자 커버'],
   ['먼지방지', '먼지 방지'],
+  ['방수방진', '방수 방진'],
+  ['열기차단', '열기 차단'],
+  ['햇빛차단', '햇빛 차단'],
+  ['사계절보호', '사계절 보호'],
 ];
 const MARKET_SEARCH_RULES = {
   Cafe24: { limit: 30, separator: ', ', compact: true, label: '공통 키워드 풀' },
-  네이버: { limit: 12, separator: ', ', compact: false, label: '스마트스토어 태그' },
-  쿠팡: { limit: 20, separator: ', ', compact: false, label: '쿠팡 검색태그' },
-  롯데ON: { limit: 14, separator: ' ', compact: false, label: '롯데ON 검색키워드' },
-  '11번가': { limit: 18, separator: ', ', compact: false, label: '11번가 검색키워드' },
-  ESM: { limit: 18, separator: ', ', compact: false, label: 'ESM 검색키워드' },
+  네이버: { limit: 12, separator: ', ', compact: true, label: '스마트스토어 태그' },
+  쿠팡: { limit: 20, separator: ', ', compact: true, label: '쿠팡 검색태그' },
+  롯데ON: { limit: 14, separator: ', ', compact: true, label: '롯데ON 검색키워드' },
+  '11번가': { limit: 18, separator: ', ', compact: true, label: '11번가 검색키워드' },
+  ESM: { limit: 18, separator: ', ', compact: true, label: 'ESM 검색키워드' },
 };
 
 function normalizeKeywordTerm(value) {
@@ -192,6 +200,15 @@ function normalizeKeywordTerm(value) {
     .replace(/[<>{}\[\]"'`]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function cleanTitleText(value) {
+  let text = normalizeKeywordTerm(value);
+  KEYWORD_BAN_WORDS.forEach((word) => {
+    text = text.replaceAll(word, ' ');
+  });
+  text = text.replace(/\b1\s*(개|입|매|p|P|pcs|PCS|pc|PC)\b/g, ' ');
+  return text.replace(/\s+/g, ' ').trim();
 }
 
 function keywordSemanticKey(value) {
@@ -312,6 +329,11 @@ function formatSearchTerms(terms, channel) {
     .join(baseRule.separator);
 }
 
+function formatExistingSearchTerms(value, channel) {
+  const terms = String(value || '').split(/[,|;\n\r]+/g).map((term) => term.trim()).filter(Boolean);
+  return formatSearchTerms(terms.length ? terms : [value], channel);
+}
+
 function keywordFieldLabel(market) {
   return (MARKET_SEARCH_RULES[market] || MARKET_SEARCH_RULES.Cafe24).label;
 }
@@ -377,7 +399,7 @@ function titleSpecTerms(row, specTerms = []) {
 
 function composeLimitedTitle(terms, limit) {
   const picked = [];
-  for (const term of uniqueList(terms)) {
+  for (const term of uniqueList(terms.map(cleanTitleText).filter(Boolean))) {
     const next = [...picked, term].join(' ');
     if (next.length > limit) continue;
     picked.push(term);
@@ -463,7 +485,7 @@ function buildMarketKeywordVariant(row, channel = { account:'A', market:'Cafe24'
         ESM: broadExcelA,
       };
   const recipe = recipeMap[channel.market] || [...activeIdentity.slice(0, 2), ...activeFn.slice(0, 2), ...activePlace.slice(0, 1), optionText];
-  const title = composeLimitedTitle(recipe, marketLimit) || row.name || row.gs;
+  const title = composeLimitedTitle(recipe, marketLimit) || cleanTitleText(row.name) || row.gs;
   const titleKeys = new Set(String(title).split(/\s+/).map(keywordSemanticKey).filter(Boolean));
   const rawSearchTerms = uniqueList([
     ...baseIdentity,
@@ -1501,9 +1523,10 @@ function KeywordWorkbench({
   const getSavedVariant = (row, item) => {
     const saved = row?.marketKeywords?.[item.key] || row?.seedProduct?.marketKeywords?.[item.key];
     if (!saved) return null;
-    const searchTerms = saved.searchTerms || saved.search_terms || (Array.isArray(saved.tags) ? saved.tags.join(', ') : '');
+    const rawSearchTerms = saved.searchTerms || saved.search_terms || (Array.isArray(saved.tags) ? saved.tags.join(', ') : '');
+    const searchTerms = formatExistingSearchTerms(rawSearchTerms, item);
     return {
-      title: saved.title || '',
+      title: cleanTitleText(saved.title || ''),
       searchTerms,
       tags: Array.isArray(saved.tags) ? saved.tags : [],
       candidateCount: Number(saved.candidateCount || (Array.isArray(saved.tags) ? saved.tags.length : 0)),
@@ -1544,19 +1567,18 @@ function KeywordWorkbench({
     if (!row) return [];
     const images = row.images || row.seedProduct?.images || {};
     const detailUrlSet = new Set(Array.isArray(images.detail) ? images.detail : []);
-    const fromListingColumns = images.selectionSource === 'listing_image_columns_only';
-    const productImage = (url) => (fromListingColumns || !detailUrlSet.has(url) ? url : '');
-    const additional = (Array.isArray(images.additional) ? images.additional : [])
-      .filter((url) => productImage(url));
+    const productImage = (url) => (url && !detailUrlSet.has(url) ? url : '');
+    const listingCandidates = Array.isArray(images.listingCandidates) ? images.listingCandidates : [];
+    const additional = Array.isArray(images.additional) ? images.additional : [];
+    const processed = Array.isArray(images.processed) ? images.processed : [];
     const urls = uniqueList([
       productImage(images.representative),
       productImage(images.sourceThumb),
       productImage(row.thumb),
-      ...(Array.isArray(images.listingCandidates) ? images.listingCandidates : []),
-      ...(Array.isArray(images.processed) ? images.processed : []),
-      ...additional,
-      ...(Array.isArray(row.listingImages) ? row.listingImages : []),
-      ...(Array.isArray(row.additionalImages) ? row.additionalImages : []),
+      ...listingCandidates.map(productImage),
+      ...processed.map(productImage),
+      ...additional.map(productImage),
+      ...(Array.isArray(row.listingImages) ? row.listingImages.map(productImage) : []),
     ].filter(Boolean));
     const sourceUrls = urls.length ? urls : [row.thumb].filter(Boolean);
     return sourceUrls.map((src, index) => ({
@@ -1642,6 +1664,9 @@ function KeywordWorkbench({
         const mainImageId = getMainImageId(row);
         const rowImageSlots = getImageSlots(row);
         const selectedImage = rowImageSlots.find((slot) => slot.id === mainImageId) || rowImageSlots[0];
+        const additionalImageSrcs = rowImageSlots
+          .filter((slot) => slot.src && slot.src !== selectedImage?.src)
+          .map((slot) => slot.src);
         items.push({
           channelKey: item.key,
           account: item.account,
@@ -1656,6 +1681,7 @@ function KeywordWorkbench({
           mainImageId,
           mainImageLabel: selectedImage?.label || '1번',
           mainImageSrc: selectedImage?.src || row.thumb,
+          additionalImageSrcs,
           thumb: row.thumb,
           price: row.price,
           optionSummary: row.opt,
@@ -1952,14 +1978,16 @@ function MarketUploadWorkbench({
     const saved = row?.marketKeywords?.[channel.key] || row?.seedProduct?.marketKeywords?.[channel.key] || {};
     const entry = queuedItemMap.get(getCellKey(row, channel));
     const tags = entry?.tags || saved.tags || [];
+    const rawSearchTerms = entry?.searchTerms || saved.searchTerms || saved.search_terms || (Array.isArray(tags) ? tags.join(', ') : '');
     return {
-      title: entry?.title || saved.title || '',
-      searchTerms: entry?.searchTerms || saved.searchTerms || saved.search_terms || (Array.isArray(tags) ? tags.join(', ') : ''),
+      title: cleanTitleText(entry?.title || saved.title || ''),
+      searchTerms: formatExistingSearchTerms(rawSearchTerms, channel),
       tags: Array.isArray(tags) ? tags : [],
       candidateCount: Number(entry?.candidateCount || saved.candidateCount || (Array.isArray(tags) ? tags.length : 0)),
       mainImageId: entry?.mainImageId || 'main',
       mainImageLabel: entry?.mainImageLabel || '1번',
       mainImageSrc: entry?.mainImageSrc || row?.thumb || '',
+      additionalImageSrcs: Array.isArray(entry?.additionalImageSrcs) ? entry.additionalImageSrcs : [],
       cafe24Url: entry?.cafe24Url || row?.cafe24Url || `https://mall.cafe24.com/${row?.gs || ''}`,
     };
   };
@@ -2047,6 +2075,7 @@ function MarketUploadWorkbench({
         searchTerms: variant.searchTerms,
         mainImage: variant.mainImageLabel,
         mainImageSrc: variant.mainImageSrc,
+        additionalImageSrcs: variant.additionalImageSrcs || [],
         cafe24Url: variant.cafe24Url,
       })),
     };
@@ -2079,6 +2108,7 @@ function MarketUploadWorkbench({
         searchTerms: item.searchTerms,
         mainImageLabel: item.mainImage,
         mainImageSrc: item.mainImageSrc,
+        additionalImageSrcs: item.additionalImageSrcs || [],
         cafe24Url: item.cafe24Url,
         error: item.error || '',
       });
@@ -2137,6 +2167,7 @@ function MarketUploadWorkbench({
       searchTerms: variant.searchTerms,
       mainImageLabel: variant.mainImageLabel,
       mainImageSrc: variant.mainImageSrc,
+      additionalImageSrcs: variant.additionalImageSrcs || [],
       cafe24Url: variant.cafe24Url,
     })), 'running');
     try {
@@ -2190,6 +2221,7 @@ function MarketUploadWorkbench({
         searchTerms: variant.searchTerms,
         mainImageLabel: variant.mainImageLabel,
         mainImageSrc: variant.mainImageSrc,
+        additionalImageSrcs: variant.additionalImageSrcs || [],
         cafe24Url: variant.cafe24Url,
       })), 'exported');
     } catch (error) {
