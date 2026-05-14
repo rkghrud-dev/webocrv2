@@ -225,12 +225,20 @@ function App() {
       return {};
     }
   });
+  const [sessionArtifacts, setSessionArtifacts] = useState({ paths: [], jobIds: [] });
   const [appLogs, setAppLogs] = useState([{time:'시작', message:'WEBOCRV2 로컬 서버 대기'}]);
   const baseProductRows = React.useMemo(() => rowsForFile(file), [file]);
   const productRows = React.useMemo(() => rowsWithUploadHistory(baseProductRows, uploadHistory), [baseProductRows, uploadHistory]);
   const addLog = (message) => {
     const time = new Date().toLocaleTimeString('ko-KR', { hour12:false });
     setAppLogs((prev) => [...prev.slice(-80), {time, message}]);
+  };
+  const rememberSessionArtifact = ({ path, jobId } = {}) => {
+    setSessionArtifacts((prev) => {
+      const paths = path ? Array.from(new Set([...(prev.paths || []), path])) : (prev.paths || []);
+      const jobIds = jobId ? Array.from(new Set([...(prev.jobIds || []), jobId])) : (prev.jobIds || []);
+      return { paths, jobIds };
+    });
   };
   useEffect(() => {
     let alive = true;
@@ -330,6 +338,7 @@ function App() {
         const response = await fetch('/api/import-source', { method: 'POST', body: form });
         const uploaded = await response.json();
         if (!response.ok || !uploaded?.ok) throw new Error(uploaded?.error || `upload ${response.status}`);
+        rememberSessionArtifact({ path: uploaded.path });
         const parsed = uploaded.parsed || {};
         const realPreview = parsed.preview || [];
         const realFile = {
@@ -365,7 +374,35 @@ function App() {
     }
   };
   const onImportClick = () => setStage('drop');
-  const resetWorkspace = () => {
+  const resetWorkspace = async () => {
+    const hasWork = file || sourceSeedJob || keywordJob || Object.keys(uploadQueue || {}).length || Object.keys(uploadHistory || {}).length;
+    if (hasWork && !window.confirm('현재까지 진행과정을 초기화합니다.\n진행 중인 작업은 중지하고, 이번 세션에서 만든 임시 원본/job/시드/export 파일을 삭제합니다.')) return;
+    const cleanupPayload = {
+      jobIds: Array.from(new Set([
+        ...(sessionArtifacts.jobIds || []),
+        sourceSeedJob?.jobId,
+        keywordJob?.jobId,
+      ].filter(Boolean))),
+      paths: Array.from(new Set([
+        ...(sessionArtifacts.paths || []),
+      ].filter(Boolean))),
+    };
+    let cleanupMessage = '작업 상태 초기화';
+    if (cleanupPayload.jobIds.length || cleanupPayload.paths.length) {
+      try {
+        const response = await fetch('/api/workspace-reset', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(cleanupPayload),
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload?.ok) throw new Error(payload?.error || `reset ${response.status}`);
+        setSeedLibrary(payload.seeds || []);
+        cleanupMessage = `작업 상태 초기화 · 삭제 ${payload.cleanup?.deleted || 0}개 · 중지 ${payload.cleanup?.stoppedJobs?.length || 0}개`;
+      } catch (error) {
+        cleanupMessage = `작업 상태 초기화 · 서버 정리 실패: ${error.message}`;
+      }
+    }
     setStage('drop');
     setFile(null);
     setFileMode('source');
@@ -375,10 +412,20 @@ function App() {
     setKeywordOptionsOpen(false);
     setSourceSeedJob(null);
     setKeywordJob(null);
+    setUploadQueue({});
+    setUploadHistory({});
+    setSessionArtifacts({ paths: [], jobIds: [] });
     setMarketSelection(DEFAULT_MARKET_SELECTION);
     setSelectedGs(new Set());
     setLastCheckedGs(null);
-    setAppLogs([{time:'초기화', message:'작업 상태 초기화'}]);
+    try {
+      localStorage.removeItem('webocr.uploadQueue');
+      localStorage.removeItem('webocr.uploadHistory');
+      localStorage.removeItem('webocr.pipeline.sourceToSeed');
+      localStorage.removeItem('webocr.pipeline.keywordSeed');
+      localStorage.removeItem('webocr.pipeline.marketUpload');
+    } catch {}
+    setAppLogs([{time:'초기화', message: cleanupMessage}]);
   };
   const switchView = (view) => {
     if (!file) return;
@@ -394,6 +441,7 @@ function App() {
         setSourceSeedJob(job);
         if (job.status === 'completed' && job.result) {
           addLog(`1차 시드 생성 완료: ${job.result.seedFileName}`);
+          rememberSessionArtifact({ path: job.result.seedPath });
           const seedPayload = await fetchSeedPayload(job.result.seedPath);
           const seedFile = seedPayloadToFile(seedPayload, {
             name: job.result.seedFileName,
@@ -472,6 +520,7 @@ function App() {
       const job = await response.json();
       if (!response.ok || !job?.ok) throw new Error(job?.error || `job ${response.status}`);
       setSourceSeedJob(job);
+      rememberSessionArtifact({ jobId: job.jobId });
       addLog(`서버 작업 생성: ${job.jobId}`);
       pollSourceSeedJob(job.jobId);
     } catch (error) {
@@ -742,6 +791,7 @@ function App() {
       const job = await response.json();
       if (!response.ok || !job?.ok) throw new Error(job?.error || `job ${response.status}`);
       setKeywordJob(job);
+      rememberSessionArtifact({ jobId: job.jobId });
       addLog(`키워드 서버 작업 생성: ${job.jobId}`);
       pollKeywordJob(job.jobId);
     } catch (error) {
@@ -1017,6 +1067,7 @@ function App() {
                 activeChannel={activeChannel}
                 onChannelChange={setActiveChannel}
                 uploadQueue={uploadQueue}
+                onRuntimeArtifact={rememberSessionArtifact}
                 onUploadHistoryChange={updateUploadHistory}/>
             </>
           )}

@@ -42,6 +42,10 @@ MARKET_KEY_SETTINGS = MARKET_KEY_ROOT / "settings.json"
 for directory in (UPLOAD_ROOT, LOGO_ROOT, JOBS_ROOT, SEED_ROOT, EXPORT_ROOT, MARKET_KEY_ROOT):
     directory.mkdir(parents=True, exist_ok=True)
 
+ACTIVE_PROCESSES: dict[str, subprocess.Popen] = {}
+ACTIVE_PROCESS_LOCK = threading.Lock()
+CANCELLED_JOB_IDS: set[str] = set()
+
 
 KEYWORD_POOL_CATEGORIES = [
     {
@@ -1614,6 +1618,28 @@ def stop_process_tree(process: subprocess.Popen) -> None:
             pass
 
 
+def register_active_process(job_id: str, process: subprocess.Popen) -> None:
+    with ACTIVE_PROCESS_LOCK:
+        ACTIVE_PROCESSES[job_id] = process
+
+
+def unregister_active_process(job_id: str, process: subprocess.Popen | None = None) -> None:
+    with ACTIVE_PROCESS_LOCK:
+        if process is None or ACTIVE_PROCESSES.get(job_id) is process:
+            ACTIVE_PROCESSES.pop(job_id, None)
+
+
+def stop_active_job(job_id: str) -> bool:
+    with ACTIVE_PROCESS_LOCK:
+        CANCELLED_JOB_IDS.add(job_id)
+        process = ACTIVE_PROCESSES.get(job_id)
+    if not process:
+        return False
+    stop_process_tree(process)
+    unregister_active_process(job_id, process)
+    return True
+
+
 def run_seed_job(job_id: str, payload: dict) -> None:
     job_path = JOBS_ROOT / f"{job_id}.json"
     log_path = JOBS_ROOT / f"{job_id}.log"
@@ -1669,40 +1695,44 @@ def run_seed_job(job_id: str, payload: dict) -> None:
                 errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
+            register_active_process(job_id, process)
             assert process.stdout is not None
             tail: list[str] = []
             max_progress = 12
             result_seen = False
-            for line in process.stdout:
-                clean = line.rstrip("\n")
-                log.write(clean + "\n")
-                log.flush()
-                tail = (tail + [clean])[-20:]
-                if clean.startswith("__RESULT__"):
-                    result_payload = json.loads(clean[len("__RESULT__"):])
-                    result_seen = True
-                line_progress, line_stage, current_gs = infer_seed_progress(clean, max_progress)
-                max_progress = max(max_progress, line_progress)
-                current = read_json(job_path, {"jobId": job_id})
-                current.update({
-                    "status": "running",
-                    "updatedAt": now_text(),
-                    "tail": tail,
-                    "progressPercent": max_progress,
-                    "currentStage": line_stage,
-                    "currentGs": current_gs or current.get("currentGs", ""),
-                })
-                write_json(job_path, current)
-                if result_seen:
-                    break
-            if result_payload:
-                try:
-                    exit_code = process.wait(timeout=3)
-                except subprocess.TimeoutExpired:
-                    stop_process_tree(process)
-                    exit_code = 0
-            else:
-                exit_code = process.wait()
+            try:
+                for line in process.stdout:
+                    clean = line.rstrip("\n")
+                    log.write(clean + "\n")
+                    log.flush()
+                    tail = (tail + [clean])[-20:]
+                    if clean.startswith("__RESULT__"):
+                        result_payload = json.loads(clean[len("__RESULT__"):])
+                        result_seen = True
+                    line_progress, line_stage, current_gs = infer_seed_progress(clean, max_progress)
+                    max_progress = max(max_progress, line_progress)
+                    current = read_json(job_path, {"jobId": job_id})
+                    current.update({
+                        "status": "running",
+                        "updatedAt": now_text(),
+                        "tail": tail,
+                        "progressPercent": max_progress,
+                        "currentStage": line_stage,
+                        "currentGs": current_gs or current.get("currentGs", ""),
+                    })
+                    write_json(job_path, current)
+                    if result_seen:
+                        break
+                if result_payload:
+                    try:
+                        exit_code = process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        stop_process_tree(process)
+                        exit_code = 0
+                else:
+                    exit_code = process.wait()
+            finally:
+                unregister_active_process(job_id, process)
 
         if exit_code != 0:
             raise RuntimeError(f"pipeline failed with exit code {exit_code}")
@@ -1767,6 +1797,8 @@ def run_seed_job(job_id: str, payload: dict) -> None:
         })
         write_json(job_path, job)
     except Exception as exc:
+        if job_id in CANCELLED_JOB_IDS:
+            return
         with log_path.open("a", encoding="utf-8", errors="replace") as log:
             log.write(f"\n[{now_text()}] ERROR {exc}\n")
         job.update({"status": "failed", "finishedAt": now_text(), "error": str(exc), "currentStage": "실패"})
@@ -1867,6 +1899,7 @@ def run_keyword_job(job_id: str, payload: dict) -> None:
                 errors="replace",
                 creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
             )
+            register_active_process(job_id, process)
             assert process.stdout is not None
             output_queue: queue.Queue = queue.Queue()
             reader = threading.Thread(target=read_process_stdout, args=(process.stdout, output_queue), daemon=True)
@@ -1888,35 +1921,38 @@ def run_keyword_job(job_id: str, payload: dict) -> None:
                 })
                 write_json(job_path, current)
 
-            while True:
-                try:
-                    item = output_queue.get(timeout=0.5)
-                except queue.Empty:
-                    item = None
+            try:
+                while True:
+                    try:
+                        item = output_queue.get(timeout=0.5)
+                    except queue.Empty:
+                        item = None
 
-                if item is stdout_done:
-                    reader_done = True
-                elif item is not None:
-                    clean = str(item).rstrip("\n")
-                    log.write(clean + "\n")
-                    log.flush()
-                    output_lines += 1
-                    tail = (tail + [clean])[-20:]
-                    update_running_stage("Codex AI 상품명/검색어 생성 중")
+                    if item is stdout_done:
+                        reader_done = True
+                    elif item is not None:
+                        clean = str(item).rstrip("\n")
+                        log.write(clean + "\n")
+                        log.flush()
+                        output_lines += 1
+                        tail = (tail + [clean])[-20:]
+                        update_running_stage("Codex AI 상품명/검색어 생성 중")
 
-                now_ts = time.time()
-                if now_ts - last_heartbeat >= 1.0:
-                    stage_text = "Codex AI 응답 대기"
-                    if output_lines:
-                        stage_text = "Codex AI 상품명/검색어 생성 중"
-                    if process.poll() is not None:
-                        stage_text = "Codex 결과 파일 확인 중"
-                    update_running_stage(stage_text)
-                    last_heartbeat = now_ts
+                    now_ts = time.time()
+                    if now_ts - last_heartbeat >= 1.0:
+                        stage_text = "Codex AI 응답 대기"
+                        if output_lines:
+                            stage_text = "Codex AI 상품명/검색어 생성 중"
+                        if process.poll() is not None:
+                            stage_text = "Codex 결과 파일 확인 중"
+                        update_running_stage(stage_text)
+                        last_heartbeat = now_ts
 
-                if process.poll() is not None and reader_done and output_queue.empty():
-                    break
-            exit_code = process.wait()
+                    if process.poll() is not None and reader_done and output_queue.empty():
+                        break
+                exit_code = process.wait()
+            finally:
+                unregister_active_process(job_id, process)
         if exit_code != 0:
             raise RuntimeError(f"codex failed with exit code {exit_code}")
 
@@ -1950,6 +1986,8 @@ def run_keyword_job(job_id: str, payload: dict) -> None:
         })
         write_json(job_path, job)
     except Exception as exc:
+        if job_id in CANCELLED_JOB_IDS:
+            return
         with log_path.open("a", encoding="utf-8", errors="replace") as log:
             log.write(f"\n[{now_text()}] ERROR {exc}\n")
         job.update({
@@ -2125,6 +2163,66 @@ def write_market_export(payload: dict) -> dict:
     }
 
 
+def remove_runtime_path(raw_path: object) -> dict:
+    path_text = text_value(raw_path)
+    if not path_text:
+        return {"path": "", "status": "skipped", "reason": "empty"}
+    path = Path(path_text)
+    if not path.is_absolute():
+        path = (ROOT / path).resolve()
+    else:
+        path = path.resolve()
+    allowed_roots = [UPLOAD_ROOT, JOBS_ROOT, SEED_ROOT, EXPORT_ROOT]
+    if not any(is_within(root, path) for root in allowed_roots):
+        return {"path": str(path), "status": "skipped", "reason": "outside runtime data"}
+    if not path.exists():
+        return {"path": str(path), "status": "missing"}
+    if path.is_dir():
+        shutil.rmtree(path)
+    else:
+        path.unlink()
+    return {"path": str(path), "status": "deleted"}
+
+
+def cleanup_workspace_artifacts(payload: dict) -> dict:
+    paths = payload.get("paths") if isinstance(payload.get("paths"), list) else []
+    job_ids = payload.get("jobIds") if isinstance(payload.get("jobIds"), list) else []
+    removed: list[dict] = []
+    stopped: list[str] = []
+    seen_paths: set[str] = set()
+
+    def remember_path(path_value: object) -> None:
+        clean = text_value(path_value)
+        if clean and clean not in seen_paths:
+            seen_paths.add(clean)
+            removed.append(remove_runtime_path(clean))
+
+    for raw_job_id in job_ids:
+        job_id = safe_name(text_value(raw_job_id), "")
+        if not job_id:
+            continue
+        if stop_active_job(job_id):
+            stopped.append(job_id)
+        job_path = JOBS_ROOT / f"{job_id}.json"
+        job_payload = read_json(job_path, {})
+        remember_path(job_path)
+        remember_path(JOBS_ROOT / f"{job_id}.log")
+        remember_path(JOBS_ROOT / f"{job_id}_keyword")
+        result = job_payload.get("result") if isinstance(job_payload.get("result"), dict) else {}
+        remember_path(result.get("keywordResultPath", ""))
+
+    for path_value in paths:
+        remember_path(path_value)
+
+    return {
+        "stoppedJobs": stopped,
+        "removed": removed,
+        "deleted": sum(1 for item in removed if item.get("status") == "deleted"),
+        "skipped": sum(1 for item in removed if item.get("status") == "skipped"),
+        "missing": sum(1 for item in removed if item.get("status") == "missing"),
+    }
+
+
 class WebOcrHandler(SimpleHTTPRequestHandler):
     server_version = "WEBOCRV2Local/0.1"
 
@@ -2210,6 +2308,9 @@ class WebOcrHandler(SimpleHTTPRequestHandler):
                 return
             if path == "/api/excel-export":
                 self.handle_excel_export()
+                return
+            if path == "/api/workspace-reset":
+                self.handle_workspace_reset()
                 return
             if path == "/api/seed-action":
                 self.handle_seed_action()
@@ -2350,6 +2451,11 @@ class WebOcrHandler(SimpleHTTPRequestHandler):
         payload = json.loads(self.read_body().decode("utf-8", errors="replace") or "{}")
         export = write_market_export(payload)
         self.send_json({"ok": True, "export": export})
+
+    def handle_workspace_reset(self) -> None:
+        payload = json.loads(self.read_body().decode("utf-8", errors="replace") or "{}")
+        cleanup = cleanup_workspace_artifacts(payload)
+        self.send_json({"ok": True, "cleanup": cleanup, "seeds": list_seed_summaries()})
 
     def handle_seed_action(self) -> None:
         payload = json.loads(self.read_body().decode("utf-8", errors="replace") or "{}")

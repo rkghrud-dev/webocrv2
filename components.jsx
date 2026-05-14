@@ -649,7 +649,7 @@ function TopBar({ source, onImport, onReset, onSettings }) {
         <kbd>/</kbd>
       </div>
       <div className="topbar-actions">
-        <GhostBtn icon={<IconClose size={16}/>} onClick={onReset}>초기화</GhostBtn>
+        <GhostBtn icon={<IconClose size={16}/>} onClick={onReset} title="현재까지 진행과정을 초기화합니다">진행 초기화</GhostBtn>
         <AuroraBtn icon={<IconUpload size={16}/>} onClick={onImport}>원본 import</AuroraBtn>
         <IconBtn icon={<IconSettings size={18}/>} label="설정" onClick={onSettings}/>
       </div>
@@ -1920,6 +1920,7 @@ function MarketUploadWorkbench({
   onChannelChange,
   uploadQueue = {},
   onUploadHistoryChange,
+  onRuntimeArtifact,
 }) {
   const [uploadStatus, setUploadStatus] = useState({});
   const scopedChannels = Object.entries(marketSelection || {})
@@ -2146,6 +2147,7 @@ function MarketUploadWorkbench({
       });
       const result = await response.json();
       if (!response.ok || !result?.ok) throw new Error(result?.error || `upload ${response.status}`);
+      onRuntimeArtifact?.({ jobId: result.jobId });
       pollUploadJob(result.jobId);
     } catch (error) {
       setUploadStatus((prev) => {
@@ -2166,6 +2168,7 @@ function MarketUploadWorkbench({
       });
       const result = await response.json();
       if (!response.ok || !result?.ok) throw new Error(result?.error || `export ${response.status}`);
+      onRuntimeArtifact?.({ path: result.export?.path });
       const link = document.createElement('a');
       link.href = result.export.url;
       link.download = result.export.fileName;
