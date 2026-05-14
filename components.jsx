@@ -42,9 +42,11 @@ function IconBtn({ icon, label, ...p }) {
 /* ── status pill ──────────────────────────────────────────── */
 const STATUS_LABEL = {
   queued:   ['대기열',       'targeted'],
+  running:  ['서버처리',     'targeted'],
   requested:['요청됨',       'targeted'],
   exported: ['엑셀 저장',     'excel'],
   uploaded: ['업로드 완료', 'uploaded'],
+  skipped:  ['제외',         'muted'],
   targeted: ['등록',         'targeted'],
   excel:    ['엑셀 생성',     'excel'],
   external: ['외부 존재',     'external'],
@@ -1541,16 +1543,24 @@ function KeywordWorkbench({
   const getImageSlots = (row) => {
     if (!row) return [];
     const images = row.images || row.seedProduct?.images || {};
+    const detailUrlSet = new Set(Array.isArray(images.detail) ? images.detail : []);
+    const fromListingColumns = images.selectionSource === 'listing_image_columns_only';
+    const productImage = (url) => (fromListingColumns || !detailUrlSet.has(url) ? url : '');
+    const additional = (Array.isArray(images.additional) ? images.additional : [])
+      .filter((url) => productImage(url));
     const urls = uniqueList([
-      images.representative,
-      images.sourceThumb,
-      row.thumb,
-      ...(Array.isArray(images.additional) ? images.additional : []),
-      ...(Array.isArray(images.detail) ? images.detail : []),
+      productImage(images.representative),
+      productImage(images.sourceThumb),
+      productImage(row.thumb),
+      ...(Array.isArray(images.listingCandidates) ? images.listingCandidates : []),
+      ...(Array.isArray(images.processed) ? images.processed : []),
+      ...additional,
+      ...(Array.isArray(row.listingImages) ? row.listingImages : []),
+      ...(Array.isArray(row.additionalImages) ? row.additionalImages : []),
     ].filter(Boolean));
     const sourceUrls = urls.length ? urls : [row.thumb].filter(Boolean);
     return sourceUrls.map((src, index) => ({
-      id: index === 0 ? 'main' : `detail-${index}`,
+      id: index === 0 ? 'main' : `image-${index}`,
       label: `${index + 1}번`,
       src,
     }));
@@ -2012,6 +2022,15 @@ function MarketUploadWorkbench({
       return { key, row, channel, variant };
     }).filter(Boolean));
   };
+  const uploadStatusLabel = (status, available) => {
+    if (status === 'running') return '서버처리';
+    if (status === 'requested') return '요청됨';
+    if (status === 'uploaded') return '완료';
+    if (status === 'failed') return '실패';
+    if (status === 'skipped') return '제외';
+    if (status === 'exported') return '엑셀저장';
+    return available ? '대기열' : '없음';
+  };
   const storeUploadPayload = (entries, action) => {
     const payload = {
       action,
@@ -2026,6 +2045,7 @@ function MarketUploadWorkbench({
         title: variant.title,
         searchTerms: variant.searchTerms,
         mainImage: variant.mainImageLabel,
+        mainImageSrc: variant.mainImageSrc,
         cafe24Url: variant.cafe24Url,
       })),
     };
@@ -2035,59 +2055,75 @@ function MarketUploadWorkbench({
     } catch {}
     return payload;
   };
-  const runApiUpload = () => {
-    const entries = buildSelectedEntries((channel) => !['11번가', 'ESM'].includes(channel.market));
-    storeUploadPayload(entries, 'apiMarketUploadQueue');
+  const applyUploadJobResults = (results = []) => {
+    if (!Array.isArray(results) || !results.length) return;
     setUploadStatus((prev) => {
       const next = {...prev};
-      entries.forEach(({ key }) => { next[key] = 'requested'; });
+      results.forEach((item) => {
+        const key = item.queueKey || `${item.channel}:${item.gs}`;
+        next[key] = item.status || 'failed';
+      });
       return next;
     });
-    onUploadHistoryChange?.(entries.map(({ row, channel, variant }) => ({
-      channelKey: channel.key,
-      account: channel.account,
-      market: channel.market,
-      gs: row.gs,
-      sourceName: row.name,
-      title: variant.title,
-      searchTerms: variant.searchTerms,
-      mainImageLabel: variant.mainImageLabel,
-      cafe24Url: variant.cafe24Url,
-    })), 'requested');
+    const grouped = results.reduce((acc, item) => {
+      const status = item.status || 'failed';
+      if (!acc[status]) acc[status] = [];
+      acc[status].push({
+        channelKey: item.channel,
+        account: item.account,
+        market: item.market,
+        gs: item.gs,
+        sourceName: item.sourceName,
+        title: item.title,
+        searchTerms: item.searchTerms,
+        mainImageLabel: item.mainImage,
+        mainImageSrc: item.mainImageSrc,
+        cafe24Url: item.cafe24Url,
+        error: item.error || '',
+      });
+      return acc;
+    }, {});
+    Object.entries(grouped).forEach(([status, items]) => onUploadHistoryChange?.(items, status));
   };
-  const downloadExcelData = (market) => {
-    const entries = buildSelectedEntries((channel) => channel.market === market);
-    storeUploadPayload(entries, `${market}ExcelExportQueue`);
-    const quote = (value) => `"${String(value ?? '').replaceAll('"', '""')}"`;
-    const lines = [
-      ['account', 'market', 'gs_code', 'source_name', 'upload_title', 'search_terms', 'main_image', 'cafe24_url', 'status'].map(quote).join(','),
-      ...entries.map(({ key, row, channel, variant }) => {
-        const status = uploadStatus[key] || 'queued';
-        return [
-          channel.account,
-          channel.market,
-          row.gs,
-          row.name,
-          variant.title,
-          variant.searchTerms || '',
-          variant.mainImageLabel,
-          variant.cafe24Url,
-          status === 'exported' ? '저장완료' : '대기',
-        ].map(quote).join(',');
-      }),
-    ];
-    const blob = new Blob([`\ufeff${lines.join('\n')}`], {type: 'text/csv;charset=utf-8;'});
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = `${market}_upload_queue_${new Date().toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(link);
-    link.click();
-    link.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  const pollUploadJob = (jobId) => {
+    window.setTimeout(async () => {
+      try {
+        const response = await fetch(`/api/jobs/${jobId}`);
+        const job = await response.json();
+        if (!response.ok || !job?.ok) throw new Error(job?.error || `job ${response.status}`);
+        if (Array.isArray(job.results)) applyUploadJobResults(job.results);
+        if (job.status === 'completed') {
+          applyUploadJobResults(job.result?.results || []);
+          return;
+        }
+        if (job.status === 'failed') {
+          setUploadStatus((prev) => {
+            const next = {...prev};
+            Object.keys(next).forEach((key) => {
+              if (next[key] === 'running') next[key] = 'failed';
+            });
+            return next;
+          });
+          return;
+        }
+        pollUploadJob(jobId);
+      } catch (error) {
+        setUploadStatus((prev) => {
+          const next = {...prev};
+          Object.keys(next).forEach((key) => {
+            if (next[key] === 'running') next[key] = 'failed';
+          });
+          return next;
+        });
+      }
+    }, 1200);
+  };
+  const runApiUpload = async () => {
+    const entries = buildSelectedEntries((channel) => !['11번가', 'ESM'].includes(channel.market));
+    const payload = storeUploadPayload(entries, 'apiMarketUploadQueue');
     setUploadStatus((prev) => {
       const next = {...prev};
-      entries.forEach(({ key }) => { next[key] = 'exported'; });
+      entries.forEach(({ key }) => { next[key] = 'running'; });
       return next;
     });
     onUploadHistoryChange?.(entries.map(({ row, channel, variant }) => ({
@@ -2099,8 +2135,67 @@ function MarketUploadWorkbench({
       title: variant.title,
       searchTerms: variant.searchTerms,
       mainImageLabel: variant.mainImageLabel,
+      mainImageSrc: variant.mainImageSrc,
       cafe24Url: variant.cafe24Url,
-    })), 'exported');
+    })), 'running');
+    try {
+      const response = await fetch('/api/market-upload', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      const result = await response.json();
+      if (!response.ok || !result?.ok) throw new Error(result?.error || `upload ${response.status}`);
+      pollUploadJob(result.jobId);
+    } catch (error) {
+      setUploadStatus((prev) => {
+        const next = {...prev};
+        entries.forEach(({ key }) => { next[key] = 'failed'; });
+        return next;
+      });
+    }
+  };
+  const downloadExcelData = async (market) => {
+    const entries = buildSelectedEntries((channel) => channel.market === market);
+    const payload = storeUploadPayload(entries, `${market}ExcelExportQueue`);
+    try {
+      const response = await fetch('/api/excel-export', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({...payload, market}),
+      });
+      const result = await response.json();
+      if (!response.ok || !result?.ok) throw new Error(result?.error || `export ${response.status}`);
+      const link = document.createElement('a');
+      link.href = result.export.url;
+      link.download = result.export.fileName;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setUploadStatus((prev) => {
+        const next = {...prev};
+        entries.forEach(({ key }) => { next[key] = 'exported'; });
+        return next;
+      });
+      onUploadHistoryChange?.(entries.map(({ row, channel, variant }) => ({
+        channelKey: channel.key,
+        account: channel.account,
+        market: channel.market,
+        gs: row.gs,
+        sourceName: row.name,
+        title: variant.title,
+        searchTerms: variant.searchTerms,
+        mainImageLabel: variant.mainImageLabel,
+        mainImageSrc: variant.mainImageSrc,
+        cafe24Url: variant.cafe24Url,
+      })), 'exported');
+    } catch (error) {
+      setUploadStatus((prev) => {
+        const next = {...prev};
+        entries.forEach(({ key }) => { next[key] = 'failed'; });
+        return next;
+      });
+    }
   };
 
   return (
@@ -2202,7 +2297,7 @@ function MarketUploadWorkbench({
                         onClick={() => available && toggleUpload(key)}>
                         <span className="upload-cell-top">
                           <input type="checkbox" checked={uploadSelection.has(key)} readOnly tabIndex="-1"/>
-                          <Pill status={status}>{status === 'requested' ? '요청됨' : status === 'exported' ? '엑셀저장' : available ? '대기열' : '없음'}</Pill>
+                          <Pill status={status}>{uploadStatusLabel(status, available)}</Pill>
                         </span>
                         <strong>{available ? variant.title : '생성 없음'}</strong>
                         <small>{available ? `${variant.candidateCount || 0}개 · ${variant.mainImageLabel}` : '키워드 없음'}</small>
